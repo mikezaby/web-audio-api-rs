@@ -17,7 +17,7 @@ use super::node_collection::AudioNodeIdSet;
 use super::{Alloc, AudioParamValues, AudioProcessor, AudioRenderQuantum, NodeCollection};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::AudioWorkletGlobalScope;
-use groups::GroupPlan;
+use groups::{GroupPlan, Mailbox};
 
 /// Connection between two audio nodes
 struct OutgoingEdge {
@@ -27,6 +27,8 @@ struct OutgoingEdge {
     other_id: AudioNodeId,
     /// index of the other Nodes input port
     other_index: usize,
+    /// index of the mailbox carrying this edge to another render group, `usize::MAX` for none
+    mailbox: usize,
 }
 
 impl std::fmt::Debug for OutgoingEdge {
@@ -276,7 +278,12 @@ impl Graph {
 
         // add to ordered list (some nodes should be processed even if not connected)
         // if the node is connected later the ordered list will be recomputed
-        self.ordered.push(index);
+        if self.plan.groups.is_empty() {
+            self.ordered.push(index);
+        } else {
+            // the node needs a place in its render group
+            self.ordered.clear();
+        }
     }
 
     pub fn add_edge(&mut self, source: (AudioNodeId, usize), dest: (AudioNodeId, usize)) {
@@ -287,6 +294,7 @@ impl Graph {
                 self_index: source.1,
                 other_id: dest.0,
                 other_index: dest.1,
+                mailbox: usize::MAX,
             });
 
         self.ordered.clear(); // void current ordering
@@ -515,83 +523,43 @@ impl Graph {
         // keep track of end-of-lifecyle nodes
         let mut nodes_dropped = false;
 
-        // process every node, in topological sorted order
-        self.ordered.iter().for_each(|index| {
-            // acquire a mutable borrow of the current processing node
-            let mut node = self.nodes.get_unchecked(*index).borrow_mut();
-
-            // let the current node process (catch any panics that may occur)
-            let params = AudioParamValues::from(&self.nodes);
-            scope.node_id.set(*index);
-            let (success, tail_time) = {
-                // We are abusing AssertUnwindSafe here, we cannot guarantee it upholds.
-                // This may lead to logic bugs later on, but it is the best that we can do.
-                // The alternative is to crash and reboot the render thread.
-                let catch_me = AssertUnwindSafe(|| node.process(params, scope));
-
-                match panic::catch_unwind(catch_me) {
-                    Ok(tail_time) => (true, tail_time),
-                    Err(e) => {
-                        node.outgoing_edges.clear();
-                        scope.report_error(e);
-                        (false, false)
-                    }
+        if self.plan.groups.is_empty() {
+            // process every node, in topological sorted order
+            for &index in &self.ordered {
+                nodes_dropped |= Self::render_node::<false>(
+                    &mut self.nodes,
+                    &mut self.plan.mailboxes,
+                    &mut self.reclaim_id_channel,
+                    index,
+                    scope,
+                );
+            }
+        } else {
+            // process every render group, in dependency order
+            let plan = &mut *self.plan;
+            for &group in &plan.order {
+                let group = &plan.groups[group];
+                for &mailbox in &group.incoming {
+                    plan.mailboxes[mailbox].deliver(&self.nodes, &self.alloc);
                 }
-            };
-
-            // iterate all outgoing edges, lookup these nodes and add to their input
-            node.outgoing_edges
-                .iter()
-                // audio params are connected to the 'hidden' usize::MAX output, ignore them here
-                .filter(|edge| edge.other_index != usize::MAX)
-                .for_each(|edge| {
-                    let mut output_node = self.nodes.get_unchecked(edge.other_id).borrow_mut();
-                    output_node.has_inputs_connected = true;
-                    let signal = &node.outputs[edge.self_index];
-                    let channel_config = &output_node.channel_config.clone();
-
-                    output_node.inputs[edge.other_index].add(signal, channel_config);
-                });
-
-            let can_free = !success || node.can_free(tail_time);
-
-            // Node is not dropped.
-            if !can_free {
-                // Reset input buffers as they will be summed up in the next render quantum.
-                node.inputs
-                    .iter_mut()
-                    .for_each(AudioRenderQuantum::make_silent);
-
-                // Reset input state
-                node.has_inputs_connected = false;
+                for &index in &group.ordered {
+                    nodes_dropped |= Self::render_node::<true>(
+                        &mut self.nodes,
+                        &mut plan.mailboxes,
+                        &mut self.reclaim_id_channel,
+                        index,
+                        scope,
+                    );
+                }
             }
 
-            drop(node); // release borrow of self.nodes
-
-            // Check if we can decommission this node (end of life)
-            if can_free {
-                // Node is dropped, remove it from the node list
-                let mut node = self.nodes.remove(*index).into_inner();
-                self.reclaim_id_channel
-                    .push(node.reclaim_id.take().unwrap());
-                node.processor.before_drop(scope);
-                drop(node);
-
-                // And remove it from the ordering after we have processed all nodes
-                nodes_dropped = true;
-
-                // Nodes are only dropped when they do not have incoming connections.
-                // But they may have AudioParams feeding into them, these can de dropped too.
-                self.nodes.values_mut().for_each(|node| {
-                    // Check if this node was connected to the dropped node. In that case, it is
-                    // either an AudioParam or the AudioListener that feeds into a PannerNode.
-                    // These should be disconnected
-                    node.get_mut()
-                        .outgoing_edges
-                        .retain(|e| e.other_id != *index);
-                });
+            // ponytail: rebuild the whole plan when a node drops, patch it in place if that shows
+            // up in profiles
+            if nodes_dropped {
+                self.ordered.clear();
+                nodes_dropped = false;
             }
-        });
+        }
 
         // If there were any nodes decommissioned, remove from graph order
         if nodes_dropped {
@@ -607,6 +575,101 @@ impl Graph {
 
         // Return the output buffer of destination node
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
+    }
+
+    /// Render one node and pass its outputs along its outgoing edges
+    ///
+    /// Returns true when the node reached the end of its life and was dropped. Without
+    /// `GROUPED`, mailboxes are not looked at, which keeps the path without groups as it was.
+    #[inline(always)]
+    fn render_node<const GROUPED: bool>(
+        nodes: &mut NodeCollection,
+        mailboxes: &mut [Mailbox],
+        reclaim_id_channel: &mut llq::Producer<AudioNodeId>,
+        index: AudioNodeId,
+        scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        // acquire a mutable borrow of the current processing node
+        let mut node = nodes.get_unchecked(index).borrow_mut();
+
+        // let the current node process (catch any panics that may occur)
+        let params = AudioParamValues::from(&*nodes);
+        scope.node_id.set(index);
+        let (success, tail_time) = {
+            // We are abusing AssertUnwindSafe here, we cannot guarantee it upholds.
+            // This may lead to logic bugs later on, but it is the best that we can do.
+            // The alternative is to crash and reboot the render thread.
+            let catch_me = AssertUnwindSafe(|| node.process(params, scope));
+
+            match panic::catch_unwind(catch_me) {
+                Ok(tail_time) => (true, tail_time),
+                Err(e) => {
+                    node.outgoing_edges.clear();
+                    scope.report_error(e);
+                    (false, false)
+                }
+            }
+        };
+
+        // iterate all outgoing edges, lookup these nodes and add to their input
+        node.outgoing_edges
+            .iter()
+            // audio params are connected to the 'hidden' usize::MAX output, ignore them here
+            .filter(|edge| edge.other_index != usize::MAX)
+            .for_each(|edge| {
+                let signal = &node.outputs[edge.self_index];
+
+                // the other node renders in another group, it picks the signal up from there
+                if GROUPED {
+                    if let Some(mailbox) = mailboxes.get_mut(edge.mailbox) {
+                        mailbox.post(signal);
+                        return;
+                    }
+                }
+
+                let mut output_node = nodes.get_unchecked(edge.other_id).borrow_mut();
+                output_node.has_inputs_connected = true;
+                let channel_config = &output_node.channel_config.clone();
+
+                output_node.inputs[edge.other_index].add(signal, channel_config);
+            });
+
+        let can_free = !success || node.can_free(tail_time);
+
+        // Node is not dropped.
+        if !can_free {
+            // Reset input buffers as they will be summed up in the next render quantum.
+            node.inputs
+                .iter_mut()
+                .for_each(AudioRenderQuantum::make_silent);
+
+            // Reset input state
+            node.has_inputs_connected = false;
+        }
+
+        drop(node); // release borrow of nodes
+
+        // Check if we can decommission this node (end of life)
+        if can_free {
+            // Node is dropped, remove it from the node list
+            let mut node = nodes.remove(index).into_inner();
+            reclaim_id_channel.push(node.reclaim_id.take().unwrap());
+            node.processor.before_drop(scope);
+            drop(node);
+
+            // Nodes are only dropped when they do not have incoming connections.
+            // But they may have AudioParams feeding into them, these can de dropped too.
+            nodes.values_mut().for_each(|node| {
+                // Check if this node was connected to the dropped node. In that case, it is
+                // either an AudioParam or the AudioListener that feeds into a PannerNode.
+                // These should be disconnected
+                node.get_mut()
+                    .outgoing_edges
+                    .retain(|e| e.other_id != index);
+            });
+        }
+
+        can_free
     }
 
     pub fn before_drop(&mut self, scope: &AudioWorkletGlobalScope) {
@@ -1029,6 +1092,50 @@ mod tests {
             .iter()
             .find(|group| group.ordered.contains(&AudioNodeId(id)));
         group.unwrap().id
+    }
+
+    /// Logs the id of every node it renders for
+    #[derive(Debug)]
+    struct LogNode(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl AudioProcessor for LogNode {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            self.0.lock().unwrap().push(scope.node_id.get().0);
+            true
+        }
+    }
+
+    #[test]
+    fn groups_render_one_after_another() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        for (id, group) in [(0, 0), (1, 1), (2, 1), (3, 2), (4, 2)] {
+            let node = Box::new(LogNode(std::sync::Arc::clone(&log)));
+            let id = AudioNodeId(id);
+            graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+        }
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 0);
+        add_edge(&mut graph, 3, 4);
+        add_edge(&mut graph, 4, 0);
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+        graph.render(&scope);
+
+        // independent groups in id order, the destination's group last
+        assert_eq!(*log.lock().unwrap(), [1, 2, 3, 4, 0]);
     }
 
     #[test]

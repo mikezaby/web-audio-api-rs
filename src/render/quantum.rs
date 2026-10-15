@@ -588,6 +588,80 @@ impl AudioRenderQuantum {
     }
 }
 
+/// How a [`QuantumCopy`] holds one channel
+#[derive(Clone, Copy, Debug)]
+enum ChannelCopy {
+    Silent,
+    /// Shares its buffer with this earlier channel
+    SameAs(usize),
+    Samples,
+}
+
+/// A copy of an [`AudioRenderQuantum`] in plain memory
+///
+/// It holds no `Rc` and no pool handle, so it can carry a signal between render groups that each
+/// have their own buffer pool. Silent and shared channels are kept as such, so the receiving side
+/// mixes the signal exactly like the original.
+#[derive(Debug, Default)]
+pub(crate) struct QuantumCopy {
+    channels: ArrayVec<ChannelCopy, MAX_CHANNELS>,
+    /// Samples of channel `i` at index `i`
+    data: Vec<[f32; RENDER_QUANTUM_SIZE]>,
+    single_valued: bool,
+}
+
+impl QuantumCopy {
+    pub(crate) fn copy_from(&mut self, quantum: &AudioRenderQuantum) {
+        let channels = &quantum.channels;
+        if self.data.len() < channels.len() {
+            // ponytail: grows on the render thread the first time a wider signal crosses groups
+            self.data.resize(channels.len(), [0.; RENDER_QUANTUM_SIZE]);
+        }
+
+        self.channels.clear();
+        for (i, channel) in channels.iter().enumerate() {
+            let shared = channels[..i]
+                .iter()
+                .position(|other| Rc::ptr_eq(&other.data, &channel.data));
+            let copy = if channel.is_silent() {
+                ChannelCopy::Silent
+            } else if let Some(j) = shared {
+                ChannelCopy::SameAs(j)
+            } else {
+                self.data[i].copy_from_slice(&channel.data[..]);
+                ChannelCopy::Samples
+            };
+            self.channels.push(copy);
+        }
+        self.single_valued = quantum.single_valued;
+    }
+
+    /// Rebuild the signal with buffers from `alloc`
+    pub(crate) fn to_quantum(&self, alloc: &Alloc) -> AudioRenderQuantum {
+        let mut channels = ArrayVec::<AudioRenderQuantumChannel, MAX_CHANNELS>::new();
+        for (i, copy) in self.channels.iter().enumerate() {
+            let channel = match *copy {
+                ChannelCopy::Silent => alloc.silence(),
+                ChannelCopy::SameAs(j) => channels[j].clone(),
+                ChannelCopy::Samples => {
+                    let mut data = alloc.inner.allocate();
+                    Rc::make_mut(&mut data).copy_from_slice(&self.data[i]);
+                    AudioRenderQuantumChannel {
+                        data,
+                        alloc: Rc::clone(&alloc.inner),
+                    }
+                }
+            };
+            channels.push(channel);
+        }
+
+        AudioRenderQuantum {
+            channels,
+            single_valued: self.single_valued,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use float_eq::assert_float_eq;
@@ -1562,5 +1636,35 @@ mod tests {
             abs_all <= 0.
         );
         assert!(!buffer.is_silent());
+    }
+
+    #[test]
+    fn test_quantum_copy_round_trip() {
+        let alloc = Alloc::with_capacity(2);
+        let mut samples = alloc.silence();
+        samples
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, s)| *s = i as f32);
+        let mut quantum = AudioRenderQuantum::from(samples);
+        quantum.set_number_of_channels(2); // channel 1 aliases channel 0
+        quantum.channels.push(alloc.silence());
+
+        let mut copy = QuantumCopy::default();
+        copy.copy_from(&quantum);
+        drop(quantum);
+
+        // another pool, like another render group
+        let other = Alloc::with_capacity(2);
+        let restored = copy.to_quantum(&other);
+
+        assert_eq!(restored.number_of_channels(), 3);
+        assert_eq!(restored.channel_data(0)[5], 5.);
+        assert!(Rc::ptr_eq(
+            &restored.channels[0].data,
+            &restored.channels[1].data
+        ));
+        assert!(Rc::ptr_eq(&restored.channels[0].alloc, &other.inner));
+        assert!(restored.channel_data(2).is_silent());
     }
 }

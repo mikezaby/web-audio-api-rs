@@ -9,9 +9,46 @@
 //! - groups that depend on each other in both directions, directly or through other groups (the
 //!   strongly connected components of the group graph). Edges cleared by a cycle breaker are gone
 //!   by then, so they do not count.
+//!
+//! Edges between groups go through mailboxes, so no buffer is shared between groups.
 
 use super::Graph;
 use crate::context::AudioNodeId;
+use crate::render::{Alloc, AudioRenderQuantum, NodeCollection, QuantumCopy};
+
+/// Carries one edge between render groups
+///
+/// The producer posts its output after it renders. The consumer adds it to its input before its
+/// own group renders.
+#[derive(Debug)]
+pub(in crate::render) struct Mailbox {
+    from: AudioNodeId,
+    output: usize,
+    to: AudioNodeId,
+    input: usize,
+    /// Set when the producer rendered this quantum
+    written: bool,
+    quantum: QuantumCopy,
+}
+
+impl Mailbox {
+    pub fn post(&mut self, signal: &AudioRenderQuantum) {
+        self.quantum.copy_from(signal);
+        self.written = true;
+    }
+
+    pub fn deliver(&mut self, nodes: &NodeCollection, alloc: &Alloc) {
+        if !std::mem::take(&mut self.written) {
+            return;
+        }
+
+        let mut node = nodes.get_unchecked(self.to).borrow_mut();
+        node.has_inputs_connected = true;
+        let signal = self.quantum.to_quantum(alloc);
+        let channel_config = node.channel_config.clone();
+        node.inputs[self.input].add(&signal, &channel_config);
+    }
+}
 
 /// A merged render group
 #[derive(Debug, Default)]
@@ -20,6 +57,8 @@ pub(super) struct Group {
     pub id: u32,
     /// Nodes of this group, in render order
     pub ordered: Vec<AudioNodeId>,
+    /// Mailboxes to deliver before rendering, ordered by producer node id, then output index
+    pub incoming: Vec<usize>,
     /// Groups that consume output of this group
     pub dependents: Vec<usize>,
     /// Number of groups this group consumes output from
@@ -33,6 +72,8 @@ pub(super) struct GroupPlan {
     pub groups: Vec<Group>,
     /// Group indices in dependency order
     pub order: Vec<usize>,
+    /// One per edge between groups
+    pub mailboxes: Vec<Mailbox>,
     // Scratch space, kept to avoid allocating on every rebuild
     ids: Vec<u32>,
     parent: Vec<usize>,
@@ -121,7 +162,23 @@ impl Scc {
 impl Graph {
     /// Build the group plan from the current node order and edges
     pub(super) fn plan_groups(&mut self) {
-        let plan = &mut self.plan;
+        // Keep the path without groups as cheap as it was: with no groups now and no plan before,
+        // no edge carries a mailbox index
+        let grouped = self
+            .nodes
+            .keys()
+            .any(|id| self.nodes.get_unchecked(id).borrow().render_group != 0);
+        if !grouped && self.plan.groups.is_empty() {
+            return;
+        }
+
+        for node in self.nodes.values_mut() {
+            for edge in &mut node.get_mut().outgoing_edges {
+                edge.mailbox = usize::MAX;
+            }
+        }
+
+        let plan = &mut *self.plan;
         plan.order.clear();
 
         plan.ids.clear();
@@ -134,6 +191,7 @@ impl Graph {
         plan.ids.dedup();
         if plan.ids.len() <= 1 {
             plan.groups.clear();
+            plan.mailboxes.clear();
             return;
         }
 
@@ -191,12 +249,14 @@ impl Graph {
         }
         if count == 1 {
             plan.groups.clear();
+            plan.mailboxes.clear();
             return;
         }
 
         plan.groups.resize_with(count, Group::default);
         for group in &mut plan.groups {
             group.ordered.clear();
+            group.incoming.clear();
             group.dependents.clear();
             group.dependencies = 0;
         }
@@ -210,6 +270,50 @@ impl Graph {
         for &id in &self.ordered {
             let group = index(self.nodes.get_unchecked(id).borrow().render_group);
             plan.groups[plan.slot[group]].ordered.push(id);
+        }
+
+        // Edges between groups go through mailboxes, reusing the previous ones
+        let mut mailboxes = 0;
+        for id in self.nodes.keys() {
+            let mut node = self.nodes.get_unchecked(id).borrow_mut();
+            let from = plan.slot[index(node.render_group)];
+            for edge in node.outgoing_edges.iter_mut() {
+                let to = if edge.other_id == id {
+                    from
+                } else {
+                    let other = self.nodes.get_unchecked(edge.other_id).borrow();
+                    plan.slot[index(other.render_group)]
+                };
+                if from == to {
+                    continue;
+                }
+
+                let mailbox = Mailbox {
+                    from: id,
+                    output: edge.self_index,
+                    to: edge.other_id,
+                    input: edge.other_index,
+                    written: false,
+                    quantum: QuantumCopy::default(),
+                };
+                match plan.mailboxes.get_mut(mailboxes) {
+                    Some(old) => {
+                        let quantum = std::mem::take(&mut old.quantum);
+                        *old = Mailbox { quantum, ..mailbox };
+                    }
+                    None => plan.mailboxes.push(mailbox),
+                }
+                plan.groups[to].incoming.push(mailboxes);
+                edge.mailbox = mailboxes;
+                mailboxes += 1;
+            }
+        }
+        plan.mailboxes.truncate(mailboxes);
+        for group in &mut plan.groups {
+            group.incoming.sort_unstable_by_key(|&m| {
+                let m = &plan.mailboxes[m];
+                (m.from.0, m.output, m.to.0, m.input)
+            });
         }
 
         for link in plan.links.iter_mut() {
