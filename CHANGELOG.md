@@ -1,5 +1,9 @@
 # Version History
 
+## Unreleased
+
+- Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering (groups render on one thread for now)
+
 ## Version 1.8.0 (2026-11-12)
 
 - Update MSRV to 1.88 (June 2025)

@@ -19,6 +19,7 @@ pub(crate) enum ControlMessage {
         inputs: usize,
         outputs: usize,
         channel_config: ChannelConfigInner,
+        render_group: u32,
     },
 
     /// Connect a node to another in the audio graph
