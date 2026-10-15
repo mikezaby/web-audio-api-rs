@@ -5,6 +5,7 @@
 - Fix: AudioBufferSourceNode looping playback starting >= loopEnd
 - Fix: PannerNode cone gain was reversed for listener orientation
 - Fix: PannerNode HRTF direction mapping of front/back and above/below
+- Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering (groups render on one thread for now)
 
 ## Version 1.8.0 (2026-11-12)
 

@@ -1008,4 +1008,37 @@ mod tests {
                 && node.inputs == node.input_channels.len()
                 && node.outputs == node.output_channels.len()));
     }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn test_render_group_includes_params_and_delay_pair() {
+        let options = AudioContextOptions {
+            sink_id: "none".into(),
+            ..AudioContextOptions::default()
+        };
+        let context = AudioContext::new(options);
+        context.set_render_group(5);
+        let _delay = context.create_delay(1.);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        context.run_diagnostics(move |diagnostics| {
+            sender.send(diagnostics).unwrap();
+        });
+        let nodes = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .graph
+            .nodes;
+
+        // destination, delay writer, delay reader, delay time param
+        assert_eq!(nodes.len(), 4);
+        for node in nodes {
+            let expected = if node.id == DESTINATION_NODE_ID.0 {
+                0
+            } else {
+                5
+            };
+            assert_eq!(node.render_group, expected, "{}", node.processor);
+        }
+    }
 }
