@@ -1,5 +1,6 @@
 //! The audio graph topology and render algorithm
 
+mod groups;
 #[cfg(test)]
 mod test;
 
@@ -16,6 +17,7 @@ use super::node_collection::AudioNodeIdSet;
 use super::{Alloc, AudioParamValues, AudioProcessor, AudioRenderQuantum, NodeCollection};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::AudioWorkletGlobalScope;
+use groups::GroupPlan;
 
 /// Connection between two audio nodes
 struct OutgoingEdge {
@@ -142,6 +144,8 @@ pub(crate) struct Graph {
     in_cycle: AudioNodeIdSet,
     /// Topological sorting helper
     cycle_breakers: Vec<AudioNodeId>,
+    /// Split of the nodes into render groups, boxed to keep `Graph` small to move
+    plan: Box<GroupPlan>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -164,6 +168,7 @@ impl Graph {
             marked_temp: vec![],
             in_cycle: AudioNodeIdSet::default(),
             cycle_breakers: vec![],
+            plan: Box::default(),
         }
     }
 
@@ -496,6 +501,8 @@ impl Graph {
         self.marked_temp = marked_temp;
         self.in_cycle = in_cycle;
         self.cycle_breakers = cycle_breakers;
+
+        self.plan_groups();
     }
 
     /// Render a single audio quantum by traversing the node list
@@ -1006,5 +1013,157 @@ mod tests {
 
         // No other dropped nodes
         assert!(node_id_consumer.pop().is_none());
+    }
+
+    fn add_grouped_node(graph: &mut Graph, id: u64, group: u32) {
+        let id = AudioNodeId(id);
+        let node = Box::new(TestNode { tail_time: true });
+        graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+    }
+
+    /// Render group id each node renders in, after merging
+    fn group_of(graph: &Graph, id: u64) -> u32 {
+        let group = graph
+            .plan
+            .groups
+            .iter()
+            .find(|group| group.ordered.contains(&AudioNodeId(id)));
+        group.unwrap().id
+    }
+
+    #[test]
+    fn group_plan_is_empty_without_groups() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 0);
+        add_edge(&mut graph, 1, 0);
+        graph.order_nodes();
+
+        assert!(graph.plan.groups.is_empty());
+    }
+
+    #[test]
+    fn group_plan_keeps_independent_groups() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 1);
+        add_grouped_node(&mut graph, 2, 1);
+        add_grouped_node(&mut graph, 3, 2);
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 0);
+        add_edge(&mut graph, 3, 0);
+        graph.order_nodes();
+
+        assert_eq!(graph.plan.groups.len(), 3);
+        assert_eq!(group_of(&graph, 0), 0);
+        assert_eq!(group_of(&graph, 1), 1);
+        assert_eq!(group_of(&graph, 2), 1);
+        assert_eq!(group_of(&graph, 3), 2);
+        // groups 1 and 2 are roots, group 0 waits for both
+        let destination = &graph.plan.groups[0];
+        assert_eq!(destination.dependencies, 2);
+        assert_eq!(graph.plan.order.last(), Some(&0));
+    }
+
+    #[test]
+    fn group_plan_merges_two_way_dependency() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 1);
+        add_grouped_node(&mut graph, 2, 2);
+        add_grouped_node(&mut graph, 3, 1);
+        add_grouped_node(&mut graph, 4, 3);
+        // 1 -> 2 -> 3 goes from group 1 through group 2 back into group 1
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 3);
+        add_edge(&mut graph, 3, 0);
+        add_edge(&mut graph, 4, 0);
+        graph.order_nodes();
+
+        assert_eq!(graph.plan.groups.len(), 3);
+        assert_eq!(group_of(&graph, 1), 1);
+        assert_eq!(group_of(&graph, 2), 1);
+        assert_eq!(group_of(&graph, 3), 1);
+        assert_eq!(group_of(&graph, 4), 3);
+    }
+
+    #[test]
+    fn group_plan_merges_three_group_cycle() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 3);
+        add_grouped_node(&mut graph, 2, 1);
+        add_grouped_node(&mut graph, 3, 2);
+        add_grouped_node(&mut graph, 4, 3);
+        add_grouped_node(&mut graph, 5, 4);
+        // group 3 -> 1 -> 2 -> 3
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 3);
+        add_edge(&mut graph, 3, 4);
+        add_edge(&mut graph, 4, 0);
+        add_edge(&mut graph, 5, 0);
+        graph.order_nodes();
+
+        assert_eq!(graph.plan.groups.len(), 3);
+        for id in 1..=4 {
+            assert_eq!(group_of(&graph, id), 1);
+        }
+        assert_eq!(group_of(&graph, 5), 4);
+    }
+
+    #[test]
+    fn group_plan_merges_groups_joined_by_param_edges() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        // the AudioListener (group 0) feeds a PannerNode (group 5) like a param
+        add_grouped_node(&mut graph, 1, 0);
+        add_grouped_node(&mut graph, 2, 5);
+        add_grouped_node(&mut graph, 3, 6);
+        add_audioparam(&mut graph, 1, 0);
+        add_audioparam(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 0);
+        add_edge(&mut graph, 3, 0);
+        graph.order_nodes();
+
+        assert_eq!(graph.plan.groups.len(), 2);
+        assert_eq!(group_of(&graph, 2), 0);
+        assert_eq!(group_of(&graph, 3), 6);
+    }
+
+    #[test]
+    fn group_plan_orders_stay_topological() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        // two tracks of three nodes, each fed by a shared source in its own group
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 9);
+        for (track, first) in [(1, 2), (2, 5)] {
+            for id in first..first + 3 {
+                add_grouped_node(&mut graph, id, track);
+            }
+            add_edge(&mut graph, 1, first);
+            add_edge(&mut graph, first, first + 1);
+            add_edge(&mut graph, first + 1, first + 2);
+            add_edge(&mut graph, first + 2, 0);
+        }
+        graph.order_nodes();
+
+        let plan = &graph.plan;
+        assert_eq!(plan.groups.len(), 4);
+        for group in &plan.groups {
+            let positions: Vec<_> = group
+                .ordered
+                .iter()
+                .map(|id| graph.ordered.iter().position(|o| o == id).unwrap())
+                .collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]));
+        }
+
+        // the shared source renders first, the destination last
+        let position = |id| plan.order.iter().position(|&g| plan.groups[g].id == id);
+        assert_eq!(position(9), Some(0));
+        assert_eq!(position(0), Some(3));
+        let shared = &plan.groups[plan.order[0]];
+        assert_eq!(shared.dependencies, 0);
+        assert_eq!(shared.dependents.len(), 2);
     }
 }
