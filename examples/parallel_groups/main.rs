@@ -31,7 +31,7 @@ fn main() {
         ..AudioContextOptions::default()
     });
 
-    tracks::build(&context, voices);
+    tracks::build(&context, voices, false);
     println!(
         "{} tracks x {voices} voices, Ctrl-C to stop",
         tracks::TRACKS

@@ -11,7 +11,8 @@ pub const VOICES: usize = 24;
 const IR_SECONDS: f32 = 1.;
 const SCALE: [f32; 5] = [0., 3., 5., 7., 10.];
 
-pub fn build(ctx: &impl BaseAudioContext, voices: usize) {
+/// With `grouped`, each track is its own render group.
+pub fn build(ctx: &impl BaseAudioContext, voices: usize, grouped: bool) {
     let sample_rate = ctx.sample_rate();
 
     let master = ctx.create_gain();
@@ -29,7 +30,9 @@ pub fn build(ctx: &impl BaseAudioContext, voices: usize) {
     }
 
     for track in 0..TRACKS {
-        // Stage A: `ctx.set_render_group(track as u32 + 1)` goes here.
+        if grouped {
+            ctx.set_render_group(track as u32 + 1);
+        }
         let bus = ctx.create_gain();
         let mut reverb = ctx.create_convolver();
         reverb.set_buffer(ir.clone());
