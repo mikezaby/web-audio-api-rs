@@ -76,6 +76,11 @@ name = "my_benchmark"
 path = "benches/my_benchmark.rs"
 harness = false
 
+[[bench]]
+name = "parallel_groups"
+path = "benches/parallel_groups.rs"
+harness = false
+
 [features]
 default = ["cpal"]
 
