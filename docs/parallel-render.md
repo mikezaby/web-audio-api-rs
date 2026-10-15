@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: plan, not started.
+Status: stage A steps 1 to 3 done on `perf/parallel-render`, step 4 next.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -110,8 +110,8 @@ The plan depends on these facts, checked on `main` at `03d0cb2`.
 ### Group rules
 
 - The destination, the `AudioListener` and its params stay in group 0.
-- A group that contains a `PannerNode` is merged into group 0, because the panner reads the listener params every quantum.
-  Mark it with a `ponytail:` comment.
+- Groups joined by a hidden edge (`other_index == usize::MAX`) are merged, because the receiver reads the sender's buffer straight from the node collection.
+  This keeps `AudioParam`s with their owner, and merges any group with a `PannerNode` into group 0, because the listener reaches each panner through a hidden edge.
   Blibliki only uses `StereoPannerNode`, so this costs Blibliki nothing.
 - Groups that depend on each other in both directions, directly or through other groups, are merged into one.
   These are the strongly connected components of the group graph (Tarjan).
@@ -172,6 +172,7 @@ Measure before committing any step that claims a speedup.
 2. The group plan in `order_nodes`: merge rules, per-group order, counts, roots.
    Unit tests in `src/render/graph/test.rs`: two-way dependency merge, three-group cycle merge, panner merge, filtered order stays topological.
 3. Mailboxes for edges between groups, and rendering groups one after another in dependency order.
+   Until step 5, registering or dropping a node while groups are in use rebuilds the whole plan.
 4. Per-group node collections and buffer pools.
    `route_message`, the channel setters, `diagnostics` and the lifecycle code find nodes through the node to group map.
 5. Deferred node removal.
@@ -182,6 +183,9 @@ Exit:
 - New offline test: the same graph rendered with and without groups differs by at most 1e-6 per sample (summing order changes), and two grouped renders are bit-identical.
 - Criterion: the path without groups is unchanged, and the grouped path on one thread is at most 5% slower.
 - Linked into `node-web-audio-api` through the path dependency (its `Cargo.toml:18` has the line commented out), the WPT suite fails exactly the tests it fails on base.
+
+Measured after step 3, M1 Pro, one thread, `cargo bench --bench parallel_groups`: 3.79 s without groups, 3.77 s with 8 groups, against 3.73 s on base.
+The small graphs in `my_benchmark` stay within 1% of base, and `bench_graph_reordering` within 2%.
 
 ### Stage B: worker pool (about 1 to 2 weeks)
 
@@ -195,9 +199,11 @@ Exit:
 - Grouped renders are bit-identical for 1, 2 and 4 render threads.
 - Stress test: an online context with sink `"none"` (`src/context/online.rs:126`) renders with 4 threads while another thread randomly creates, connects, disconnects and drops nodes across groups.
   Run it under ThreadSanitizer (nightly, `-Zsanitizer=thread`).
-- New `benches/parallel_groups.rs`: 8 groups, each oscillators into biquads into gains plus one `ConvolverNode`, summed into a gain to the destination, 10 seconds offline.
+- `benches/parallel_groups.rs`, on the graph in `examples/parallel_groups/tracks.rs`: 8 groups of 24 voices (sawtooth, biquad, gain, all modulated by a track LFO) into a bus with a `ConvolverNode` send, summed into a gain to the destination, 10 seconds offline.
+  Base, one thread: 3.73 s on an M1 Pro.
   At least 3x at 4 threads on an M1.
   Record the Pi number next to it.
+  `cargo run --release --example parallel_groups` plays the same graph in real time and prints clock speed, load and underruns.
   A small graph with one group is at most 2% slower than upstream.
 - On the Pi, online at PipeWire quantum 1024, no underruns.
 
