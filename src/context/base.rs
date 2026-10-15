@@ -312,6 +312,20 @@ pub trait BaseAudioContext {
         RENDER_QUANTUM_SIZE
     }
 
+    /// Set the render group of the nodes created after this call (non-standard)
+    ///
+    /// Render groups are the units that can render on separate threads. Group 0 is the default
+    /// and holds the destination. A node keeps its group for life, and its `AudioParam`s join it.
+    ///
+    /// Groups that feed each other in both directions, directly or through other groups, are
+    /// merged. So a source shared by several groups (an LFO, a clock) should not sit in the same
+    /// group as the mix they all feed into, or they all merge into one.
+    ///
+    /// The current group is shared by every thread that creates nodes on this context.
+    fn set_render_group(&self, group: u32) {
+        self.base().set_render_group(group);
+    }
+
     /// Create an `AudioParam`.
     ///
     /// Call this inside the `register` closure when setting up your `AudioNode`

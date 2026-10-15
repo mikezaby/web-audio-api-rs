@@ -89,6 +89,8 @@ pub struct AudioNodeDiagnostics {
     pub cycle_breaker: bool,
     /// Whether this node reports side effects.
     pub has_side_effects: bool,
+    /// Render group the node was registered in, see `BaseAudioContext::set_render_group`.
+    pub render_group: u32,
 }
 
 /// Snapshot of a graph connection from one node output to another node input.

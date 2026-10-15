@@ -15,7 +15,7 @@ use crate::AudioListener;
 
 use crossbeam_channel::{SendError, Sender};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
 /// This struct assigns new [`AudioNodeId`]s for [`AudioNode`]s
@@ -114,6 +114,8 @@ struct ConcreteBaseAudioContextInner {
     event_send: Sender<EventDispatch>,
     /// Current audio graph connections (from node, output port, to node, input port)
     connections: Mutex<HashSet<(AudioNodeId, usize, AudioNodeId, usize)>>,
+    /// Render group of the nodes registered from now on
+    render_group: AtomicU32,
 }
 
 impl BaseAudioContext for ConcreteBaseAudioContext {
@@ -154,6 +156,7 @@ impl ConcreteBaseAudioContext {
             event_loop,
             event_send,
             connections: Mutex::new(HashSet::new()),
+            render_group: AtomicU32::new(0),
         };
         let base = Self {
             inner: Arc::new(base_inner),
@@ -254,6 +257,7 @@ impl ConcreteBaseAudioContext {
             inputs: node.number_of_inputs(),
             outputs: node.number_of_outputs(),
             channel_config: node.channel_config().inner(),
+            render_group: self.inner.render_group.load(Ordering::Relaxed),
         };
 
         // if this is the AudioListener or its params, do not add it to the graph just yet
@@ -404,6 +408,10 @@ impl ConcreteBaseAudioContext {
     #[must_use]
     pub(super) fn sample_rate(&self) -> f32 {
         self.inner.sample_rate
+    }
+
+    pub(super) fn set_render_group(&self, group: u32) {
+        self.inner.render_group.store(group, Ordering::Relaxed);
     }
 
     /// This is the time in seconds of the sample frame immediately following the last sample-frame

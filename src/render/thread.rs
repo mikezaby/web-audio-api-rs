@@ -144,6 +144,7 @@ impl RenderThread {
                 inputs,
                 outputs,
                 channel_config,
+                render_group,
             } => {
                 self.graph.as_mut().unwrap().add_node(
                     node_id,
@@ -152,6 +153,7 @@ impl RenderThread {
                     inputs,
                     outputs,
                     channel_config,
+                    render_group,
                 );
             }
             ConnectNode {

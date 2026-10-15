@@ -6,6 +6,7 @@
 - `decode_audio_data` and `decode_audio_data_sync` no longer require the reader to be `'static`
 - Fix: `AudioBufferSourceNode` could hang the render thread when wrapping extremely narrow loops
 - Fix: `AudioBufferSourceNode` could panic at the loop boundary
+- Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering (groups render on one thread for now)
 
 ## Version 1.7.0 (2026-08-06)
 

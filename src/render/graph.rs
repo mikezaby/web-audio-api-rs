@@ -62,6 +62,8 @@ pub struct Node {
     has_inputs_connected: bool,
     /// Indicates if the node can act as a cycle breaker (only DelayNode for now)
     cycle_breaker: bool,
+    /// Render group the node was registered in
+    render_group: u32,
 }
 
 impl std::fmt::Debug for Node {
@@ -73,6 +75,7 @@ impl std::fmt::Debug for Node {
             .field("outgoing_edges", &self.outgoing_edges)
             .field("control_handle_dropped", &self.control_handle_dropped)
             .field("cycle_breaker", &self.cycle_breaker)
+            .field("render_group", &self.render_group)
             .finish_non_exhaustive()
     }
 }
@@ -209,6 +212,7 @@ impl Graph {
                 has_inputs_connected: node.has_inputs_connected,
                 cycle_breaker: node.cycle_breaker,
                 has_side_effects: node.processor.has_side_effects(),
+                render_group: node.render_group,
             });
         }
 
@@ -231,6 +235,7 @@ impl Graph {
         !self.nodes.is_empty()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_node(
         &mut self,
         index: AudioNodeId,
@@ -239,6 +244,7 @@ impl Graph {
         number_of_inputs: usize,
         number_of_outputs: usize,
         channel_config: ChannelConfigInner,
+        render_group: u32,
     ) {
         // todo: pre-allocate the buffers on the control thread
 
@@ -259,6 +265,7 @@ impl Graph {
                 control_handle_dropped: false,
                 has_inputs_connected: false,
                 cycle_breaker: false,
+                render_group,
             }),
         );
 
@@ -636,7 +643,7 @@ mod tests {
     fn add_node(graph: &mut Graph, id: u64, node: Box<dyn AudioProcessor>) {
         let id = AudioNodeId(id);
         let reclaim_id = llq::Node::new(id);
-        graph.add_node(id, reclaim_id, node, 1, 1, config());
+        graph.add_node(id, reclaim_id, node, 1, 1, config(), 0);
     }
 
     fn add_edge(graph: &mut Graph, from: u64, to: u64) {
