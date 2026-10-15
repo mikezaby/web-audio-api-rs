@@ -225,6 +225,19 @@ The master stays in group 0.
 Blibliki records the dependency on a non-standard API in an ADR when this lands.
 Exit: Blibliki `pnpm tsc`, `pnpm lint`, `pnpm test`, and a device check on the Pi with the XL3.
 
+### Stage E, optional: voice banks
+
+A Blibliki track is 8 voice chains (source, filter, amp, each 8 voices by default) summed into one effects chain with a single voice.
+Up to that sum the voices do not depend on each other, so a heavy track can be split into banks of voices, each its own render group.
+
+- It only helps when one track is longer than its share: the heaviest track takes more than the total track work divided by the core count.
+  Gate 3 measures exactly this.
+  With balanced tracks it adds groups, mailbox copies and syncs for no gain.
+- It conflicts with Blibliki worklet cut 2, which renders every voice of a poly envelope in one worklet.
+  Do that cut first, because it lowers total work on any core count.
+  A bank then gets its own poly worklet, so split into 2 or 4 banks, not 8 single voices.
+- Blibliki side: the engine's `PolyModule` sets the bank's group while it builds each voice, and the track's LFOs stay in a group before the banks.
+
 ## Working notes
 
 - `origin` here and in the `node-web-audio-api` clone is upstream.
