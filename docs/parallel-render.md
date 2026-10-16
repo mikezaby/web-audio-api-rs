@@ -223,7 +223,9 @@ In real time at 64 voices per track, 4 threads halve the average load (45% again
 Helpers at normal priority get preempted while the callback thread waits for their group, so step 3 comes next.
 
 With step 3 (real-time priority, `audio_thread_priority` without D-Bus), back to back at 64 voices per track: 1 thread misses 18.2% of callbacks at 92% load; 4 threads miss 0.6% at 35% load, peaks up to 122%, in 10 of 18 seconds.
-The remaining misses are single callbacks, a candidate for spinning a little before a helper sleeps.
+The remaining misses are single callbacks.
+Spinning before a helper sleeps makes them worse, because at real-time priority it counts against the time-constraint budget: 0.2% missed callbacks without spin, 1.1% with a 50 us spin, 34% with a 3 ms spin (macOS, 4 threads, 64 voices per track).
+So helpers sleep as soon as the queue is empty, and the "spin, then park" item above is settled as "park".
 
 ### Stage C: one JS worklet worker per group, in `node-web-audio-api`
 
