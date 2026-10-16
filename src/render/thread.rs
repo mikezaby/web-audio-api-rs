@@ -198,6 +198,10 @@ impl RenderThread {
                 }
                 self.set_state(AudioContextState::Running);
             }
+            SetRenderWorkers { workers } => {
+                // ponytail: replacing helpers while rendering joins the old ones on this thread
+                self.graph.as_mut().unwrap().set_workers(workers);
+            }
             NodeMessage { id, mut msg } => {
                 self.graph.as_mut().unwrap().route_message(id, msg.as_mut());
                 if let Some(gc) = self.garbage_collector.as_mut() {
