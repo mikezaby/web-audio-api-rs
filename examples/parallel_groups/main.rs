@@ -9,6 +9,8 @@ mod tracks;
 // A clock speed (context time over wall time) below 1.0 means rendering cannot keep up.
 //
 // `cargo run --release --example parallel_groups [voices per track, default 24]`
+// `RENDER_GROUPS=1 cargo run --release --example parallel_groups` puts each track in its own
+// render group.
 //
 // If you are on Linux and use ALSA as audio backend backend, you might want to run
 // the example with the `WEB_AUDIO_LATENCY=playback ` env variable which will
@@ -31,9 +33,10 @@ fn main() {
         ..AudioContextOptions::default()
     });
 
-    tracks::build(&context, voices, false);
+    let grouped = std::env::var("RENDER_GROUPS").is_ok();
+    tracks::build(&context, voices, grouped);
     println!(
-        "{} tracks x {voices} voices, Ctrl-C to stop",
+        "{} tracks x {voices} voices, render groups {grouped}, Ctrl-C to stop",
         tracks::TRACKS
     );
 
