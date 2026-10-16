@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 5 done on `perf/parallel-render`, stage B steps 1 to 3 working (spin tuning and the stress test remain); the stage A exit checks through `node-web-audio-api` remain.
+Status: stage A steps 1 to 5 and stage B steps 1 to 3 done on `perf/parallel-render`; the stage B stress test (step 4) and the stage A exit checks through `node-web-audio-api` remain.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -226,6 +226,14 @@ With step 3 (real-time priority, `audio_thread_priority` without D-Bus), back to
 The remaining misses are single callbacks.
 Spinning before a helper sleeps makes them worse, because at real-time priority it counts against the time-constraint budget: 0.2% missed callbacks without spin, 1.1% with a 50 us spin, 34% with a 3 ms spin (macOS, 4 threads, 64 voices per track).
 So helpers sleep as soon as the queue is empty, and the "spin, then park" item above is settled as "park".
+
+The remaining misses had another cause, found by tracing slow quanta (each group's queue, start and end times, thread and CPU core):
+macOS ran the real-time helpers on the efficiency cores (CPUs 0 and 1 on the M1 Pro), where a track group took 1.09 ms against 0.29 ms on a performance core, so the quantum waited for the helpers.
+The audio callback thread is in the output device's IO workgroup, which tells the scheduler its deadline; the helpers were not.
+A higher QoS class did not move them.
+Now the helpers join the IO workgroup of the device the context plays to (`kAudioDevicePropertyIOThreadOSWorkgroup`, `src/io/workgroup.rs`).
+Back to back at 64 voices per track: 1 thread misses 6.3% of callbacks at 88% load, peaks 140%; 4 threads miss none in 18 seconds at 31% load, peaks 52%.
+Linux has no workgroups, and the Pi 5 has no efficiency cores, so this part is macOS only.
 
 ### Stage C: one JS worklet worker per group, in `node-web-audio-api`
 

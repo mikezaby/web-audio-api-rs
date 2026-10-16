@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering
-- Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum
+- Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum. Real-time helpers get real-time priority and, on macOS, join the output device's audio workgroup
 
 ## Version 1.8.0 (2026-11-12)
 
