@@ -14,9 +14,43 @@
 //! through a mailbox between merged groups, straight into the other pool within one. So a buffer
 //! never leaves its render group, however the groups merge now or split later.
 
+use std::cell::UnsafeCell;
+use std::sync::atomic::AtomicUsize;
+
 use super::Graph;
 use crate::context::AudioNodeId;
 use crate::render::{AudioRenderQuantum, NodeCollection, QuantumCopy};
+
+/// A value that one thread at a time works on, in the order the render schedule gives
+///
+/// Mailboxes and drop lists sit in these, so render threads can share the plan while each works
+/// on its own group.
+#[derive(Debug, Default)]
+pub(in crate::render) struct SyncCell<T>(UnsafeCell<T>);
+
+// SAFETY: every caller of `get` upholds that one thread at a time works on the value, ordered by
+// the schedule's atomics and work queue (see `Workers`)
+unsafe impl<T: Send> Sync for SyncCell<T> {}
+
+impl<T> SyncCell<T> {
+    pub fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+
+    /// # Safety
+    ///
+    /// No other reference to the value may be alive. During a quantum, only the thread that
+    /// renders the group the value belongs to may call this.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get(&self) -> &mut T {
+        // SAFETY: guaranteed by the caller
+        unsafe { &mut *self.0.get() }
+    }
+}
 
 /// Carries one edge between render groups
 ///
@@ -66,7 +100,7 @@ pub(super) struct Group {
     /// Number of groups this group consumes output from
     pub dependencies: usize,
     /// Nodes that ended this quantum, removed once every group rendered
-    pub dropped: Vec<AudioNodeId>,
+    pub dropped: SyncCell<Vec<AudioNodeId>>,
 }
 
 /// How the graph splits into render groups, rebuilt with the node order
@@ -77,7 +111,9 @@ pub(super) struct GroupPlan {
     /// Group indices in dependency order
     pub order: Vec<usize>,
     /// One per edge between groups
-    pub mailboxes: Vec<Mailbox>,
+    pub mailboxes: Vec<SyncCell<Mailbox>>,
+    /// Per group, the groups it still waits for in this quantum
+    pub pending: Vec<AtomicUsize>,
     // Scratch space, kept to avoid allocating on every rebuild
     ids: Vec<u32>,
     parent: Vec<usize>,
@@ -252,11 +288,13 @@ impl Graph {
             plan.slot[v] = plan.slot[root];
         }
         plan.groups.resize_with(count, Group::default);
+        plan.pending.resize_with(count, AtomicUsize::default);
         for group in &mut plan.groups {
             group.ordered.clear();
             group.incoming.clear();
             group.dependents.clear();
             group.dependencies = 0;
+            group.dropped.get_mut().clear();
         }
         for (v, &id) in ids.iter().enumerate() {
             if find(parent, v) == v {
@@ -296,10 +334,11 @@ impl Graph {
                 };
                 match plan.mailboxes.get_mut(mailboxes) {
                     Some(old) => {
+                        let old = old.get_mut();
                         let quantum = std::mem::take(&mut old.quantum);
                         *old = Mailbox { quantum, ..mailbox };
                     }
-                    None => plan.mailboxes.push(mailbox),
+                    None => plan.mailboxes.push(SyncCell::new(mailbox)),
                 }
                 plan.groups[to].incoming.push(mailboxes);
                 edge.mailbox = mailboxes;
@@ -307,9 +346,10 @@ impl Graph {
             }
         }
         plan.mailboxes.truncate(mailboxes);
+        let mailboxes = &mut plan.mailboxes;
         for group in &mut plan.groups {
             group.incoming.sort_unstable_by_key(|&m| {
-                let m = &plan.mailboxes[m];
+                let m = mailboxes[m].get_mut();
                 (m.from.0, m.output, m.to.0, m.input)
             });
         }

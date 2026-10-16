@@ -6,6 +6,7 @@ use std::any::Any;
 use crate::context::AudioBackendDiagnostics;
 use crate::context::AudioNodeId;
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
+use crate::render::graph::workers::Workers;
 use crate::render::graph::Graph;
 use crate::render::AudioProcessor;
 
@@ -85,6 +86,9 @@ pub(crate) enum ControlMessage {
         id: AudioNodeId,
         interpretation: ChannelInterpretation,
     },
+
+    /// Render groups on helper threads too, or on the render thread alone with `None`
+    SetRenderWorkers { workers: Option<Box<Workers>> },
 }
 
 /// Helper object to emit single notification

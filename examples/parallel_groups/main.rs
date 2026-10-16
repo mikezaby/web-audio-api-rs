@@ -10,7 +10,7 @@ mod tracks;
 //
 // `cargo run --release --example parallel_groups [voices per track, default 24]`
 // `RENDER_GROUPS=1 cargo run --release --example parallel_groups` puts each track in its own
-// render group.
+// render group, `RENDER_THREADS=4` also renders the groups on 4 threads.
 //
 // If you are on Linux and use ALSA as audio backend backend, you might want to run
 // the example with the `WEB_AUDIO_LATENCY=playback ` env variable which will
@@ -28,15 +28,21 @@ fn main() {
         Ok("playback") => AudioContextLatencyCategory::Playback,
         _ => AudioContextLatencyCategory::default(),
     };
+    let render_threads = std::env::var("RENDER_THREADS").map_or(1, |threads| {
+        threads.parse().expect("RENDER_THREADS must be a number")
+    });
     let context = AudioContext::new(AudioContextOptions {
         latency_hint,
+        render_threads,
         ..AudioContextOptions::default()
     });
 
-    let grouped = std::env::var("RENDER_GROUPS").is_ok();
+    // threads only help with groups to spread over them
+    let grouped = std::env::var("RENDER_GROUPS").is_ok() || render_threads > 1;
     tracks::build(&context, voices, grouped);
     println!(
-        "{} tracks x {voices} voices, render groups {grouped}, Ctrl-C to stop",
+        "{} tracks x {voices} voices, render groups {grouped}, render threads {render_threads}, \
+         Ctrl-C to stop",
         tracks::TRACKS
     );
 
