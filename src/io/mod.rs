@@ -17,6 +17,7 @@ use crate::stats::AudioStats;
 use crate::RENDER_QUANTUM_SIZE;
 
 mod none;
+pub(crate) mod workgroup;
 pub(crate) use none::NoneBackend;
 
 #[cfg(feature = "cpal")]
@@ -250,6 +251,11 @@ pub(crate) trait AudioBackendManager: Send + Sync + 'static {
 
     /// The audio output device - `""` means the default device
     fn sink_id(&self) -> &str;
+
+    /// The OS workgroup of the output device's IO thread, for helper render threads to join
+    fn render_workgroup(&self) -> Option<std::sync::Arc<workgroup::AudioWorkgroup>> {
+        None
+    }
 
     fn enumerate_devices_sync() -> BackendResult<Vec<MediaDeviceInfo>>
     where

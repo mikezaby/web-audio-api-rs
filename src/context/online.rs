@@ -14,6 +14,7 @@ use crate::media_devices::{enumerate_devices_sync, MediaDeviceInfoKind};
 use crate::media_streams::{MediaStream, MediaStreamTrack};
 use crate::message::{ControlMessage, OneshotNotify};
 use crate::node::{self, AudioNodeOptions};
+use crate::render::graph::workers::RealTime;
 use crate::render::graph::Graph;
 use crate::MediaElement;
 use crate::{is_valid_sample_rate, AudioPlaybackStats, AudioRenderCapacity, Event};
@@ -293,9 +294,14 @@ impl AudioContext {
         );
 
         if render_threads > 1 {
-            // helpers get real-time priority for the callback size the backend asks for
-            let frames = io::buffer_size_for_latency_category(latency_hint, backend.sample_rate());
-            base.set_render_threads(render_threads, Some(frames));
+            // helpers run like the callback thread: real-time priority for the callback size the
+            // backend asks for, in the workgroup of the device it plays to
+            // ponytail: after `set_sink_id` they stay in the first device's workgroup
+            let real_time = RealTime {
+                frames: io::buffer_size_for_latency_category(latency_hint, backend.sample_rate()),
+                workgroup: backend.render_workgroup(),
+            };
+            base.set_render_threads(render_threads, Some(real_time));
         }
 
         // Setup AudioRenderCapacity for this context
