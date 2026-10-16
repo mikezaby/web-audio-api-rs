@@ -100,6 +100,44 @@ fn grouped_render_matches_ungrouped() {
     }
 }
 
+/// Short notes in several groups, their handles dropped so they leave the graph when they end
+fn render_notes(grouped: bool) -> AudioBuffer {
+    let mut ctx = OfflineAudioContext::new(1, LENGTH, 48000.);
+    let master = ctx.create_gain();
+    master.gain().set_value(0.2);
+    master.connect(&ctx.destination());
+
+    for note in 0..24 {
+        if grouped {
+            ctx.set_render_group(note % 4 + 1);
+        }
+        let start = note as f64 * 0.02;
+        let mut osc = ctx.create_oscillator();
+        osc.frequency().set_value(110. * (1. + note as f32 / 4.));
+        let amp = ctx.create_gain();
+        amp.gain().set_value(0.5);
+        osc.connect(&amp);
+        amp.connect(&master);
+        osc.start_at(start);
+        osc.stop_at(start + 0.05);
+    }
+
+    ctx.start_rendering_sync()
+}
+
+#[test]
+fn grouped_render_with_ending_nodes_matches_ungrouped() {
+    let plain = render_notes(false);
+    let grouped = render_notes(true);
+
+    let plain = plain.get_channel_data(0);
+    let grouped = grouped.get_channel_data(0);
+    assert!(plain.iter().any(|&s| s.abs() > 0.1), "graph renders sound");
+    for (i, (a, b)) in plain.iter().zip(grouped).enumerate() {
+        assert!((a - b).abs() <= 1e-6, "sample {i}: {a} != {b}");
+    }
+}
+
 #[test]
 fn grouped_renders_are_bit_identical() {
     let first = render(true);
