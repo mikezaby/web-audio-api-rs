@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 5 and stage B steps 1 to 3 done on `perf/parallel-render`; the stage B stress test (step 4) and the stage A exit checks through `node-web-audio-api` remain.
+Status: stage A steps 1 to 5 and stage B steps 1 to 4 done on `perf/parallel-render`; the stage A exit checks through `node-web-audio-api`, the Pi numbers and stage C remain.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -210,6 +210,9 @@ Exit:
 - Grouped renders are bit-identical for 1, 2 and 4 render threads.
 - Stress test: an online context with sink `"none"` (`src/context/online.rs:126`) renders with 4 threads while another thread randomly creates, connects, disconnects and drops nodes across groups.
   Run it under ThreadSanitizer (nightly, `-Zsanitizer=thread`).
+  Done in `tests/render_threads_stress.rs`: about 17,800 random changes in 3 seconds, a probe per group checks that groups render on several threads, and a panic hook fails the test on any panic, also one the scheduler catches.
+  Clean for seeds 1 to 11, and under ThreadSanitizer for seeds 1 to 4 with no warning; with the render thread no longer waiting for the helpers, ThreadSanitizer reports 99 races, so it does watch this code:
+  `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --target aarch64-apple-darwin --no-default-features --test render_threads_stress`
 - `benches/parallel_groups.rs`, on the graph in `examples/parallel_groups/tracks.rs`: 8 groups of 24 voices (sawtooth, biquad, gain, all modulated by a track LFO) into a bus with a `ConvolverNode` send, summed into a gain to the destination, 10 seconds offline.
   Base, one thread: 3.73 s on an M1 Pro.
   At least 3x at 4 threads on an M1.
