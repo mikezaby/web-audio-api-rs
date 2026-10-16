@@ -65,6 +65,8 @@ pub(super) struct Group {
     pub dependents: Vec<usize>,
     /// Number of groups this group consumes output from
     pub dependencies: usize,
+    /// Nodes that ended this quantum, removed once every group rendered
+    pub dropped: Vec<AudioNodeId>,
 }
 
 /// How the graph splits into render groups, rebuilt with the node order

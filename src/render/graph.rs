@@ -548,31 +548,10 @@ impl Graph {
                     scope,
                 );
             }
-        } else {
-            // process every render group, in dependency order
-            let plan = &mut *self.plan;
-            for &group in &plan.order {
-                let group = &plan.groups[group];
-                for &mailbox in &group.incoming {
-                    plan.mailboxes[mailbox].deliver(&self.nodes);
-                }
-                for &index in &group.ordered {
-                    nodes_dropped |= Self::render_node::<true>(
-                        &mut self.nodes,
-                        &mut plan.mailboxes,
-                        &mut self.reclaim_id_channel,
-                        index,
-                        scope,
-                    );
-                }
-            }
-
+        } else if self.render_groups(scope) {
             // ponytail: rebuild the whole plan when a node drops, patch it in place if that shows
             // up in profiles
-            if nodes_dropped {
-                self.ordered.clear();
-                nodes_dropped = false;
-            }
+            self.ordered.clear();
         }
 
         // If there were any nodes decommissioned, remove from graph order
@@ -591,10 +570,48 @@ impl Graph {
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
     }
 
+    /// Render every group in dependency order, then remove the nodes that ended
+    ///
+    /// Kept out of `render` so the path without groups stays as compact as it was. Returns true
+    /// when nodes were removed.
+    #[inline(never)]
+    fn render_groups(&mut self, scope: &AudioWorkletGlobalScope) -> bool {
+        let plan = &mut *self.plan;
+        for &group in &plan.order {
+            let group = &mut plan.groups[group];
+            for &mailbox in &group.incoming {
+                plan.mailboxes[mailbox].deliver(&self.nodes);
+            }
+            for &index in &group.ordered {
+                let ended = Self::render_node::<true>(
+                    &mut self.nodes,
+                    &mut plan.mailboxes,
+                    &mut self.reclaim_id_channel,
+                    index,
+                    scope,
+                );
+                if ended {
+                    group.dropped.push(index);
+                }
+            }
+        }
+
+        // Ended nodes leave only now, so the node collection stays the same while groups render
+        let mut nodes_dropped = false;
+        for group in &mut plan.groups {
+            for index in group.dropped.drain(..) {
+                Self::remove_node(&mut self.nodes, &mut self.reclaim_id_channel, index, scope);
+                nodes_dropped = true;
+            }
+        }
+        nodes_dropped
+    }
+
     /// Render one node and pass its outputs along its outgoing edges
     ///
-    /// Returns true when the node reached the end of its life and was dropped. Without
-    /// `GROUPED`, mailboxes are not looked at, which keeps the path without groups as it was.
+    /// Returns true when the node reached the end of its life. Without `GROUPED` the node is
+    /// removed right away and mailboxes are not looked at, which keeps the path without groups as
+    /// it was. With `GROUPED` the caller removes it once every group rendered.
     #[inline(always)]
     fn render_node<const GROUPED: bool>(
         nodes: &mut NodeCollection,
@@ -669,27 +686,38 @@ impl Graph {
 
         drop(node); // release borrow of nodes
 
-        // Check if we can decommission this node (end of life)
-        if can_free {
-            // Node is dropped, remove it from the node list
-            let mut node = nodes.remove(index).into_inner();
-            reclaim_id_channel.push(node.reclaim_id.take().unwrap());
-            node.processor.before_drop(scope);
-            drop(node);
-
-            // Nodes are only dropped when they do not have incoming connections.
-            // But they may have AudioParams feeding into them, these can de dropped too.
-            nodes.values_mut().for_each(|node| {
-                // Check if this node was connected to the dropped node. In that case, it is
-                // either an AudioParam or the AudioListener that feeds into a PannerNode.
-                // These should be disconnected
-                node.get_mut()
-                    .outgoing_edges
-                    .retain(|e| e.other_id != index);
-            });
+        if !GROUPED && can_free {
+            Self::remove_node(nodes, reclaim_id_channel, index, scope);
         }
 
         can_free
+    }
+
+    /// Decommission a node at the end of its life
+    #[inline(always)]
+    fn remove_node(
+        nodes: &mut NodeCollection,
+        reclaim_id_channel: &mut llq::Producer<AudioNodeId>,
+        index: AudioNodeId,
+        scope: &AudioWorkletGlobalScope,
+    ) {
+        // Node is dropped, remove it from the node list
+        let mut node = nodes.remove(index).into_inner();
+        reclaim_id_channel.push(node.reclaim_id.take().unwrap());
+        scope.node_id.set(index);
+        node.processor.before_drop(scope);
+        drop(node);
+
+        // Nodes are only dropped when they do not have incoming connections.
+        // But they may have AudioParams feeding into them, these can de dropped too.
+        nodes.values_mut().for_each(|node| {
+            // Check if this node was connected to the dropped node. In that case, it is
+            // either an AudioParam or the AudioListener that feeds into a PannerNode.
+            // These should be disconnected
+            node.get_mut()
+                .outgoing_edges
+                .retain(|e| e.other_id != index);
+        });
     }
 
     pub fn before_drop(&mut self, scope: &AudioWorkletGlobalScope) {
@@ -1312,6 +1340,55 @@ mod tests {
             assert!(node.outputs.iter().all(|q| q.uses_pool(pool)), "node {id}");
             assert_eq!(node.outputs[0].channel_data(0)[0], 1., "node {id}");
         }
+    }
+
+    /// Renders once, logging its id, then logs 100 + its id when dropped
+    #[derive(Debug)]
+    struct EndingNode(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl AudioProcessor for EndingNode {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            self.0.lock().unwrap().push(scope.node_id.get().0);
+            false
+        }
+
+        fn before_drop(&mut self, scope: &AudioWorkletGlobalScope) {
+            self.0.lock().unwrap().push(100 + scope.node_id.get().0);
+        }
+    }
+
+    #[test]
+    fn grouped_removal_waits_for_the_quantum_to_finish() {
+        let (node_id_producer, mut node_id_consumer) = llq::Queue::new().split();
+        let mut graph = Graph::new(node_id_producer);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let nodes: [(u64, u32, Box<dyn AudioProcessor>); 3] = [
+            (0, 0, Box::new(LogNode(std::sync::Arc::clone(&log)))),
+            (1, 1, Box::new(EndingNode(std::sync::Arc::clone(&log)))),
+            (2, 2, Box::new(LogNode(std::sync::Arc::clone(&log)))),
+        ];
+        for (id, group, node) in nodes {
+            let id = AudioNodeId(id);
+            graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+        }
+        add_edge(&mut graph, 1, 0);
+        add_edge(&mut graph, 2, 0);
+        graph.mark_control_handle_dropped(AudioNodeId(1));
+
+        let scope = test_scope();
+        graph.render(&scope);
+        assert_eq!(*log.lock().unwrap(), [1, 2, 0, 101]);
+        assert_eq!(node_id_consumer.pop().map(|id| id.0), Some(1));
+
+        log.lock().unwrap().clear();
+        graph.render(&scope);
+        assert_eq!(*log.lock().unwrap(), [2, 0]);
     }
 
     #[test]
