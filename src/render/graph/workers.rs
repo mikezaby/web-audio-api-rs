@@ -66,8 +66,6 @@ pub(crate) struct Workers {
     done: (Sender<()>, Receiver<()>),
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
-    // DEBUG(wait-experiment): WEB_AUDIO_GROUP_WAIT=spin waits as before, spinning
-    spin: bool,
 }
 
 impl std::fmt::Debug for Workers {
@@ -134,7 +132,6 @@ impl Workers {
             done,
             shared,
             handles,
-            spin: std::env::var("WEB_AUDIO_GROUP_WAIT").is_ok_and(|v| v == "spin"),
         }
     }
 
@@ -175,27 +172,17 @@ impl Workers {
 
         // Work too, and sleep while no group is ready, until the last group finished. Spinning
         // holds a core the helpers or the threads they wait for need: at real-time priority on
-        // Linux, `yield_now` gives the core to no thread of normal priority.
-        let mut idle = 0_u32;
+        // Linux, `yield_now` gives the core to no thread of normal priority. On a Pi 5 at 4
+        // threads, a spin then yield read 1830% load against 167% for this wait.
         while self.shared.remaining.load(Ordering::Acquire) > 0 {
             let group = match self.work.try_recv() {
                 Ok(group) => Some(group),
-                Err(_) if self.spin => {
-                    idle += 1;
-                    if idle < 64 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
-                    None
-                }
                 Err(_) => crossbeam_channel::select! {
                     recv(self.work) -> group => group.ok(),
                     recv(self.done.1) -> _ => None,
                 },
             };
             if let Some(group) = group {
-                idle = 0;
                 work(
                     nodes,
                     plan,

@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 5 and stage B steps 1 to 4 done on `perf/parallel-render`, stage C steps 1 to 3 on `perf/render-groups` in `node-web-audio-api`; the WPT checks, the Pi numbers and stage C step 4 remain.
+Status: stage A steps 1 to 5 and stage B steps 1 to 4 done on `perf/parallel-render`, stage C steps 1 to 4 on `perf/render-groups` in `node-web-audio-api`, stage D in Blibliki (ADR 59), with Pi numbers for Showcase under stage D.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -270,6 +270,34 @@ The instrument sets each track's group while it builds that track's modules, inc
 The master stays in group 0.
 Blibliki records the dependency on a non-standard API in an ADR when this lands.
 Exit: Blibliki `pnpm tsc`, `pnpm lint`, `pnpm test`, and a device check on the Pi with the XL3.
+
+Done in Blibliki as ADR 59: each module selects its group when it reaches the context, and a resolver spreads the tracks over the groups.
+On the Pi 5 it first lagged badly, for three causes found in turn (Showcase, 7 tracks and 26 worklets, `pnpm recipes:load`, 20 seconds each):
+
+1. The groups merged into one, so the helpers never ran (0 timeslices in `/proc/<tid>/schedstat`).
+   A filter's inner gain module had no patch id and fell in group 0, which then fed every track both ways, and a mod matrix entry tied two track groups.
+   Blibliki now gives a module with no id the group of the module building it, and keeps tracks that feed each other in one group.
+2. Every waiting thread spun.
+   The render thread spun then yielded while it waited for groups, and at real-time priority Linux gives that core to no normal thread.
+   A worklet Worker kept spinning its event loop for 3 ms after each call, so it never slept while playing.
+   With a Worker per group there were more spinning threads than cores, and the Workers with work queued for one.
+   Now the render thread blocks until a group is ready or the last one finished, and a Worker waits on its channel once its 50 us poll after a call ends.
+3. A sleeping Worker at normal priority could wait milliseconds to run when woken, which showed as peaks over 150%.
+   On Linux the Workers now run at `SCHED_FIFO` 50, above the helpers (10) and below PipeWire (83).
+
+| Pi 5, Showcase                        | load     | peak      | late callbacks |
+| ------------------------------------- | -------- | --------- | -------------- |
+| 1 thread, before                      | 87-90%   | 102-137%  | 0.3-1.2%       |
+| 2 threads, groups merged              | 121-126% | 177-245%  | 100%           |
+| 2 threads, groups apart, spinning     | 96-120%  | 200-2256% | 35-39%         |
+| 4 threads, groups apart, spinning     | 1830%    | 6705%     | 100%           |
+| 1 thread, Workers wait and real time  | 82%      | 100-104%  | 0.2%           |
+| 2 threads, Workers wait and real time | 61%      | 79-80%    | 0%             |
+| 4 threads, Workers wait and real time | 66-67%   | 86-87%    | 0%             |
+
+Two runs a row at least. The real-time rows at 2 and 4 threads ran the Workers at priority 50, the 1 thread row at 10. At 10, one of two runs at 4 threads peaked at 208% (0.2% late).
+Waiting Workers at normal priority read 66-68% load at 2 threads, but peaks of 146-179% and 0.3-0.9% late.
+4 threads gain nothing over 2: Showcase's tracks fill about two cores.
 
 ### Stage E, optional: voice banks
 
