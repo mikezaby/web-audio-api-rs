@@ -1,12 +1,22 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
+use std::time::Duration;
+
 use web_audio_api::context::{BaseAudioContext, OfflineAudioContext};
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, OscillatorType};
+use web_audio_api::worklet::{
+    AudioParamValues, AudioWorkletGlobalScope, AudioWorkletNode, AudioWorkletNodeOptions,
+    AudioWorkletProcessor,
+};
 use web_audio_api::AudioBuffer;
 
 const LENGTH: usize = 48000 / 2;
 
 /// A graph with every kind of edge between render groups, rendered with or without groups
-fn render(grouped: bool) -> AudioBuffer {
+fn render(grouped: bool, threads: usize) -> AudioBuffer {
     let mut ctx = OfflineAudioContext::new(2, LENGTH, 48000.);
+    ctx.set_render_threads(threads);
     let group = |group| {
         if grouped {
             ctx.set_render_group(group);
@@ -80,8 +90,8 @@ fn render(grouped: bool) -> AudioBuffer {
 
 #[test]
 fn grouped_render_matches_ungrouped() {
-    let plain = render(false);
-    let grouped = render(true);
+    let plain = render(false, 1);
+    let grouped = render(true, 1);
 
     for channel in 0..2 {
         let plain = plain.get_channel_data(channel);
@@ -101,8 +111,9 @@ fn grouped_render_matches_ungrouped() {
 }
 
 /// Short notes in several groups, their handles dropped so they leave the graph when they end
-fn render_notes(grouped: bool) -> AudioBuffer {
+fn render_notes(grouped: bool, threads: usize) -> AudioBuffer {
     let mut ctx = OfflineAudioContext::new(1, LENGTH, 48000.);
+    ctx.set_render_threads(threads);
     let master = ctx.create_gain();
     master.gain().set_value(0.2);
     master.connect(&ctx.destination());
@@ -127,8 +138,8 @@ fn render_notes(grouped: bool) -> AudioBuffer {
 
 #[test]
 fn grouped_render_with_ending_nodes_matches_ungrouped() {
-    let plain = render_notes(false);
-    let grouped = render_notes(true);
+    let plain = render_notes(false, 1);
+    let grouped = render_notes(true, 1);
 
     let plain = plain.get_channel_data(0);
     let grouped = grouped.get_channel_data(0);
@@ -139,14 +150,73 @@ fn grouped_render_with_ending_nodes_matches_ungrouped() {
 }
 
 #[test]
-fn grouped_renders_are_bit_identical() {
-    let first = render(true);
-    let second = render(true);
+fn grouped_renders_are_bit_identical_for_any_thread_count() {
+    let one = render(true, 1);
+    let notes_one = render_notes(true, 1);
 
-    for channel in 0..2 {
+    for threads in [1, 2, 4] {
+        let many = render(true, threads);
+        for channel in 0..2 {
+            assert_eq!(
+                one.get_channel_data(channel),
+                many.get_channel_data(channel),
+                "{threads} threads"
+            );
+        }
+        let notes = render_notes(true, threads);
         assert_eq!(
-            first.get_channel_data(channel),
-            second.get_channel_data(channel)
+            notes_one.get_channel_data(0),
+            notes.get_channel_data(0),
+            "{threads} threads, nodes ending"
         );
     }
+}
+
+/// Records which threads it renders on
+struct ThreadProbe(Arc<Mutex<HashSet<ThreadId>>>);
+
+impl AudioWorkletProcessor for ThreadProbe {
+    type ProcessorOptions = Arc<Mutex<HashSet<ThreadId>>>;
+
+    fn constructor(threads: Self::ProcessorOptions) -> Self {
+        Self(threads)
+    }
+
+    fn process<'a, 'b>(
+        &mut self,
+        _inputs: &'b [&'a [&'a [f32]]],
+        _outputs: &'b mut [&'a mut [&'a mut [f32]]],
+        _params: AudioParamValues<'b>,
+        _scope: &'b AudioWorkletGlobalScope,
+    ) -> bool {
+        self.0.lock().unwrap().insert(std::thread::current().id());
+        // long enough for helper threads to take groups before the render thread gets to them
+        std::thread::sleep(Duration::from_micros(200));
+        true
+    }
+}
+
+/// Number of threads that rendered 8 groups for 20 quanta
+fn threads_used(render_threads: usize) -> usize {
+    let mut ctx = OfflineAudioContext::new(1, 128 * 20, 48000.);
+    ctx.set_render_threads(render_threads);
+    let threads = Arc::new(Mutex::new(HashSet::new()));
+    for group in 1..=8 {
+        ctx.set_render_group(group);
+        let options = AudioWorkletNodeOptions {
+            processor_options: Arc::clone(&threads),
+            ..AudioWorkletNodeOptions::default()
+        };
+        let probe = AudioWorkletNode::new::<ThreadProbe>(&ctx, options);
+        probe.connect(&ctx.destination());
+    }
+    let _ = ctx.start_rendering_sync();
+    let count = threads.lock().unwrap().len();
+    count
+}
+
+#[test]
+fn groups_render_on_several_threads() {
+    assert_eq!(threads_used(1), 1);
+    assert!(threads_used(4) > 1);
 }

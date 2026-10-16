@@ -142,6 +142,15 @@ impl OfflineAudioContext {
         }
     }
 
+    /// Render on `threads` threads, the calling thread included (non-standard)
+    ///
+    /// Only nodes in different render groups render in parallel, see
+    /// [`BaseAudioContext::set_render_group`]. 0 and 1 both render on the calling thread alone.
+    /// Call this before rendering starts.
+    pub fn set_render_threads(&self, threads: usize) {
+        self.base.set_render_threads(threads);
+    }
+
     /// Given the current connections and scheduled changes, starts rendering audio.
     ///
     /// This function will block the current thread and returns the rendered `AudioBuffer`

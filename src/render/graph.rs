@@ -3,6 +3,7 @@
 mod groups;
 #[cfg(test)]
 mod test;
+pub(crate) mod workers;
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -17,7 +18,8 @@ use super::node_collection::AudioNodeIdSet;
 use super::{Alloc, AudioParamValues, AudioProcessor, AudioRenderQuantum, NodeCollection};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::AudioWorkletGlobalScope;
-use groups::{GroupPlan, Mailbox};
+use groups::{GroupPlan, Mailbox, SyncCell};
+use workers::{Workers, MAX_GROUPS};
 
 /// Connection between two audio nodes
 struct OutgoingEdge {
@@ -151,6 +153,8 @@ pub(crate) struct Graph {
     cycle_breakers: Vec<AudioNodeId>,
     /// Split of the nodes into render groups, boxed to keep `Graph` small to move
     plan: Box<GroupPlan>,
+    /// Helper threads rendering groups alongside the render thread, boxed to keep `Graph` small
+    workers: Option<Box<Workers>>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -174,7 +178,13 @@ impl Graph {
             in_cycle: AudioNodeIdSet::default(),
             cycle_breakers: vec![],
             plan: Box::default(),
+            workers: None,
         }
+    }
+
+    /// Render groups on the helpers too, or on the render thread alone with `None`
+    pub fn set_workers(&mut self, workers: Option<Box<Workers>>) {
+        self.workers = workers;
     }
 
     #[cfg(feature = "diagnostics")]
@@ -540,13 +550,10 @@ impl Graph {
         if self.plan.groups.is_empty() {
             // process every node, in topological sorted order
             for &index in &self.ordered {
-                nodes_dropped |= Self::render_node::<false>(
-                    &mut self.nodes,
-                    &mut self.plan.mailboxes,
-                    &mut self.reclaim_id_channel,
-                    index,
-                    scope,
-                );
+                if Self::render_node::<false>(&self.nodes, &[], index, scope) {
+                    Self::remove_node(&mut self.nodes, &mut self.reclaim_id_channel, index, scope);
+                    nodes_dropped = true;
+                }
             }
         } else if self.render_groups(scope) {
             // ponytail: rebuild the whole plan when a node drops, patch it in place if that shows
@@ -576,30 +583,22 @@ impl Graph {
     /// when nodes were removed.
     #[inline(never)]
     fn render_groups(&mut self, scope: &AudioWorkletGlobalScope) -> bool {
-        let plan = &mut *self.plan;
-        for &group in &plan.order {
-            let group = &mut plan.groups[group];
-            for &mailbox in &group.incoming {
-                plan.mailboxes[mailbox].deliver(&self.nodes);
+        match &self.workers {
+            Some(workers) if (2..=MAX_GROUPS).contains(&self.plan.groups.len()) => {
+                workers.render(&self.nodes, &self.plan, scope);
             }
-            for &index in &group.ordered {
-                let ended = Self::render_node::<true>(
-                    &mut self.nodes,
-                    &mut plan.mailboxes,
-                    &mut self.reclaim_id_channel,
-                    index,
-                    scope,
-                );
-                if ended {
-                    group.dropped.push(index);
+            _ => {
+                for &group in &self.plan.order {
+                    // SAFETY: one thread renders the groups one after another, in dependency order
+                    unsafe { Self::render_group(&self.nodes, &self.plan, group, scope) };
                 }
             }
         }
 
         // Ended nodes leave only now, so the node collection stays the same while groups render
         let mut nodes_dropped = false;
-        for group in &mut plan.groups {
-            for index in group.dropped.drain(..) {
+        for group in &mut self.plan.groups {
+            for index in group.dropped.get_mut().drain(..) {
                 Self::remove_node(&mut self.nodes, &mut self.reclaim_id_channel, index, scope);
                 nodes_dropped = true;
             }
@@ -607,16 +606,41 @@ impl Graph {
         nodes_dropped
     }
 
+    /// Deliver the mailboxes of one group, render its nodes and note the ones that ended
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must be the only one working on this group, and every group it depends
+    /// on must have finished this quantum.
+    unsafe fn render_group(
+        nodes: &NodeCollection,
+        plan: &GroupPlan,
+        group: usize,
+        scope: &AudioWorkletGlobalScope,
+    ) {
+        let group = &plan.groups[group];
+        for &mailbox in &group.incoming {
+            // SAFETY: its producer finished, and only this group delivers it
+            unsafe { plan.mailboxes[mailbox].get() }.deliver(nodes);
+        }
+        // SAFETY: only the thread working on this group touches its drop list
+        let dropped = unsafe { group.dropped.get() };
+        for &index in &group.ordered {
+            if Self::render_node::<true>(nodes, &plan.mailboxes, index, scope) {
+                dropped.push(index);
+            }
+        }
+    }
+
     /// Render one node and pass its outputs along its outgoing edges
     ///
-    /// Returns true when the node reached the end of its life. Without `GROUPED` the node is
-    /// removed right away and mailboxes are not looked at, which keeps the path without groups as
-    /// it was. With `GROUPED` the caller removes it once every group rendered.
+    /// Returns true when the node reached the end of its life, the caller removes it. Without
+    /// `GROUPED`, mailboxes and render groups are not looked at, which keeps the path without
+    /// groups as it was.
     #[inline(always)]
     fn render_node<const GROUPED: bool>(
-        nodes: &mut NodeCollection,
-        mailboxes: &mut [Mailbox],
-        reclaim_id_channel: &mut llq::Producer<AudioNodeId>,
+        nodes: &NodeCollection,
+        mailboxes: &[SyncCell<Mailbox>],
         index: AudioNodeId,
         scope: &AudioWorkletGlobalScope,
     ) -> bool {
@@ -624,7 +648,7 @@ impl Graph {
         let mut node = nodes.get_unchecked(index).borrow_mut();
 
         // let the current node process (catch any panics that may occur)
-        let params = AudioParamValues::from(&*nodes);
+        let params = AudioParamValues::from(nodes);
         scope.node_id.set(index);
         let (success, tail_time) = {
             // We are abusing AssertUnwindSafe here, we cannot guarantee it upholds.
@@ -652,8 +676,10 @@ impl Graph {
 
                 // the other node renders in another group, it picks the signal up from there
                 if GROUPED {
-                    if let Some(mailbox) = mailboxes.get_mut(edge.mailbox) {
-                        mailbox.post(signal);
+                    if let Some(mailbox) = mailboxes.get(edge.mailbox) {
+                        // SAFETY: this node is the only producer of the mailbox, and it renders
+                        // in the group of the calling thread
+                        unsafe { mailbox.get() }.post(signal);
                         return;
                     }
                 }
@@ -682,12 +708,6 @@ impl Graph {
 
             // Reset input state
             node.has_inputs_connected = false;
-        }
-
-        drop(node); // release borrow of nodes
-
-        if !GROUPED && can_free {
-            Self::remove_node(nodes, reclaim_id_channel, index, scope);
         }
 
         can_free

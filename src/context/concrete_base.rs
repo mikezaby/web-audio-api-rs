@@ -8,6 +8,7 @@ use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
 use crate::message::ControlMessage;
 use crate::node::{AudioDestinationNode, AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::AudioParam;
+use crate::render::graph::workers::Workers;
 use crate::render::AudioProcessor;
 use crate::spatial::AudioListenerParams;
 
@@ -412,6 +413,20 @@ impl ConcreteBaseAudioContext {
 
     pub(super) fn set_render_group(&self, group: u32) {
         self.inner.render_group.store(group, Ordering::Relaxed);
+    }
+
+    /// Render groups on `threads` threads, the render thread included
+    ///
+    /// The helpers are spawned here, so the render thread never spawns threads.
+    pub(super) fn set_render_threads(&self, threads: usize) {
+        let workers = (threads > 1).then(|| {
+            Box::new(Workers::spawn(
+                threads - 1,
+                self.sample_rate(),
+                &self.inner.event_send,
+            ))
+        });
+        self.send_control_msg(ControlMessage::SetRenderWorkers { workers });
     }
 
     /// This is the time in seconds of the sample frame immediately following the last sample-frame

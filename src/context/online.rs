@@ -129,6 +129,14 @@ pub struct AudioContextOptions {
 
     /// Option to request a default, optimized or specific render quantum size. It is a hint that might not be honored.
     pub render_size_hint: AudioContextRenderSizeCategory,
+
+    /// Number of threads that render the audio graph, the audio callback thread included
+    /// (non-standard)
+    ///
+    /// Only nodes in different render groups render in parallel, see
+    /// [`BaseAudioContext::set_render_group`].
+    /// 0 and 1 both mean the audio callback thread alone.
+    pub render_threads: usize,
 }
 
 /// This interface represents an audio graph whose `AudioDestinationNode` is routed to a real-time
@@ -249,6 +257,7 @@ impl AudioContext {
         // Set up the audio output thread
         let (control_thread_init, render_thread_init) = io::thread_init();
         let startup_pending = Arc::clone(&render_thread_init.startup_pending);
+        let render_threads = options.render_threads;
         let backend = io::build_output(options, render_thread_init.clone())?;
 
         let ControlThreadInit {
@@ -281,6 +290,10 @@ impl AudioContext {
             false,
             node_id_consumer,
         );
+
+        if render_threads > 1 {
+            base.set_render_threads(render_threads);
+        }
 
         // Setup AudioRenderCapacity for this context
         let render_capacity = AudioRenderCapacity::new(base.clone(), stats.clone());
@@ -423,6 +436,7 @@ impl AudioContext {
             latency_hint: AudioContextLatencyCategory::default(), // todo reuse existing setting
             sink_id,
             render_size_hint: AudioContextRenderSizeCategory::default(), // todo reuse existing setting
+            render_threads: 0, // the graph keeps its render threads, only the stream is replaced
         };
         log::debug!("SinkChange: starting audio stream");
         *backend_manager_guard = io::build_output(options, self.render_thread_init.clone())?;

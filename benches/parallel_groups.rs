@@ -22,20 +22,27 @@ mod tracks;
 const SAMPLE_RATE: f32 = 48000.;
 const DURATION: usize = 10;
 
-fn render_tracks(grouped: bool) {
+fn render_tracks(grouped: bool, threads: usize) {
     let length = SAMPLE_RATE as usize * DURATION;
     let mut ctx = OfflineAudioContext::new(2, black_box(length), SAMPLE_RATE);
+    ctx.set_render_threads(threads);
     tracks::build(&ctx, tracks::VOICES, grouped);
     assert_eq!(ctx.start_rendering_sync().length(), length);
 }
 
 fn bench_tracks(c: &mut Criterion) {
     c.bench_function("parallel_groups_8_tracks", |b| {
-        b.iter(|| render_tracks(false))
+        b.iter(|| render_tracks(false, 1))
     });
     c.bench_function("parallel_groups_8_tracks_grouped", |b| {
-        b.iter(|| render_tracks(true))
+        b.iter(|| render_tracks(true, 1))
     });
+    for threads in [2, 4] {
+        c.bench_function(
+            &format!("parallel_groups_8_tracks_{threads}_threads"),
+            |b| b.iter(|| render_tracks(true, threads)),
+        );
+    }
 }
 
 criterion_group! {
