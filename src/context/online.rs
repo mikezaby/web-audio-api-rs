@@ -258,6 +258,7 @@ impl AudioContext {
         let (control_thread_init, render_thread_init) = io::thread_init();
         let startup_pending = Arc::clone(&render_thread_init.startup_pending);
         let render_threads = options.render_threads;
+        let latency_hint = options.latency_hint;
         let backend = io::build_output(options, render_thread_init.clone())?;
 
         let ControlThreadInit {
@@ -292,7 +293,9 @@ impl AudioContext {
         );
 
         if render_threads > 1 {
-            base.set_render_threads(render_threads);
+            // helpers get real-time priority for the callback size the backend asks for
+            let frames = io::buffer_size_for_latency_category(latency_hint, backend.sample_rate());
+            base.set_render_threads(render_threads, Some(frames));
         }
 
         // Setup AudioRenderCapacity for this context
@@ -1054,5 +1057,31 @@ mod tests {
             };
             assert_eq!(node.render_group, expected, "{}", node.processor);
         }
+    }
+
+    #[test]
+    fn test_render_threads_render_and_close() {
+        use crate::node::{AudioNode, AudioScheduledSourceNode};
+
+        let options = AudioContextOptions {
+            sink_id: "none".into(),
+            render_threads: 4,
+            ..AudioContextOptions::default()
+        };
+        let context = AudioContext::new(options);
+        for group in 1..=8 {
+            context.set_render_group(group);
+            let mut osc = context.create_oscillator();
+            osc.connect(&context.destination());
+            osc.start();
+        }
+
+        let start = context.current_time();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            context.current_time() > start,
+            "renders with helper threads"
+        );
+        context.close_sync();
     }
 }
