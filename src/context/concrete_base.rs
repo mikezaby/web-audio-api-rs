@@ -417,13 +417,15 @@ impl ConcreteBaseAudioContext {
 
     /// Render groups on `threads` threads, the render thread included
     ///
-    /// The helpers are spawned here, so the render thread never spawns threads.
-    pub(super) fn set_render_threads(&self, threads: usize) {
+    /// The helpers are spawned here, so the render thread never spawns threads. With
+    /// `real_time_frames`, the callback size in frames, they run at real-time priority.
+    pub(super) fn set_render_threads(&self, threads: usize, real_time_frames: Option<usize>) {
         let workers = (threads > 1).then(|| {
             Box::new(Workers::spawn(
                 threads - 1,
                 self.sample_rate(),
                 &self.inner.event_send,
+                real_time_frames,
             ))
         });
         self.send_control_msg(ControlMessage::SetRenderWorkers { workers });

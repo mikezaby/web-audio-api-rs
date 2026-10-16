@@ -257,7 +257,7 @@ pub(crate) trait AudioBackendManager: Send + Sync + 'static {
 }
 
 /// Calculate buffer size in frames for a given latency category
-fn buffer_size_for_latency_category(
+pub(crate) fn buffer_size_for_latency_category(
     latency_cat: AudioContextLatencyCategory,
     sample_rate: f32,
 ) -> usize {
