@@ -68,6 +68,8 @@ pub struct Node {
     cycle_breaker: bool,
     /// Render group the node was registered in
     render_group: u32,
+    /// Buffer pool of its render group
+    alloc: Alloc,
 }
 
 impl std::fmt::Debug for Node {
@@ -132,8 +134,9 @@ impl Node {
 pub(crate) struct Graph {
     /// Processing Nodes
     nodes: NodeCollection,
-    /// Allocator for audio buffers
-    alloc: Alloc,
+    /// Buffer pool per render group. A buffer never leaves the nodes of its group, so groups
+    /// can render on separate threads, however they are merged.
+    pools: Vec<(u32, Alloc)>,
     /// Message channel to notify control thread of reclaimable AudioNodeIds
     reclaim_id_channel: llq::Producer<AudioNodeId>,
     /// Topological ordering of the nodes
@@ -163,7 +166,7 @@ impl Graph {
     pub fn new(reclaim_id_channel: llq::Producer<AudioNodeId>) -> Self {
         Graph {
             nodes: NodeCollection::new(),
-            alloc: Alloc::with_capacity(64),
+            pools: vec![(0, Alloc::with_capacity(64))],
             reclaim_id_channel,
             ordered: vec![],
             marked: AudioNodeIdSet::default(),
@@ -255,10 +258,20 @@ impl Graph {
     ) {
         // todo: pre-allocate the buffers on the control thread
 
+        let alloc = match self.pools.iter().find(|(group, _)| *group == render_group) {
+            Some((_, alloc)) => alloc.clone(),
+            None => {
+                // ponytail: the pool of a new render group is allocated on the render thread
+                let alloc = Alloc::with_capacity(16);
+                self.pools.push((render_group, alloc.clone()));
+                alloc
+            }
+        };
+
         // set input and output buffers to single channel of silence, will be upmixed when
         // necessary
-        let inputs = vec![AudioRenderQuantum::from(self.alloc.silence()); number_of_inputs];
-        let outputs = vec![AudioRenderQuantum::from(self.alloc.silence()); number_of_outputs];
+        let inputs = vec![AudioRenderQuantum::from(alloc.silence()); number_of_inputs];
+        let outputs = vec![AudioRenderQuantum::from(alloc.silence()); number_of_outputs];
 
         self.nodes.insert(
             index,
@@ -273,6 +286,7 @@ impl Graph {
                 has_inputs_connected: false,
                 cycle_breaker: false,
                 render_group,
+                alloc,
             }),
         );
 
@@ -540,7 +554,7 @@ impl Graph {
             for &group in &plan.order {
                 let group = &plan.groups[group];
                 for &mailbox in &group.incoming {
-                    plan.mailboxes[mailbox].deliver(&self.nodes, &self.alloc);
+                    plan.mailboxes[mailbox].deliver(&self.nodes);
                 }
                 for &index in &group.ordered {
                     nodes_dropped |= Self::render_node::<true>(
@@ -631,7 +645,13 @@ impl Graph {
                 output_node.has_inputs_connected = true;
                 let channel_config = &output_node.channel_config.clone();
 
-                output_node.inputs[edge.other_index].add(signal, channel_config);
+                if GROUPED && output_node.render_group != node.render_group {
+                    // same merged group, other render group: copy into its pool
+                    let signal = signal.copy_into(&output_node.alloc);
+                    output_node.inputs[edge.other_index].add(&signal, channel_config);
+                } else {
+                    output_node.inputs[edge.other_index].add(signal, channel_config);
+                }
             });
 
         let can_free = !success || node.can_free(tail_time);
@@ -1216,6 +1236,97 @@ mod tests {
             assert_eq!(group_of(&graph, id), 1);
         }
         assert_eq!(group_of(&graph, 5), 4);
+    }
+
+    /// Writes 1.0 on its output
+    #[derive(Debug)]
+    struct OneNode;
+
+    impl AudioProcessor for OneNode {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            outputs[0].channel_data_mut(0).fill(1.);
+            true
+        }
+    }
+
+    /// Passes its input buffer through, sharing it
+    #[derive(Debug)]
+    struct PassNode;
+
+    impl AudioProcessor for PassNode {
+        fn process(
+            &mut self,
+            inputs: &[AudioRenderQuantum],
+            outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            outputs[0] = inputs[0].clone();
+            true
+        }
+    }
+
+    fn test_scope() -> AudioWorkletGlobalScope {
+        AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        }
+    }
+
+    #[test]
+    fn buffers_stay_in_the_pool_of_their_group() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let nodes: [(u64, u32, Box<dyn AudioProcessor>); 4] = [
+            (0, 0, Box::new(PassNode)),
+            (1, 1, Box::new(OneNode)),
+            (2, 2, Box::new(PassNode)),
+            (3, 1, Box::new(PassNode)),
+        ];
+        for (id, group, node) in nodes {
+            let id = AudioNodeId(id);
+            graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+        }
+        // groups 1 and 2 merge (1 -> 2 -> 1), and feed group 0 through a mailbox
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 3);
+        add_edge(&mut graph, 3, 0);
+
+        let scope = test_scope();
+        graph.render(&scope);
+        graph.render(&scope);
+
+        assert_eq!(graph.plan.groups.len(), 2);
+        for id in 0..4 {
+            let node = graph.nodes.get_unchecked(AudioNodeId(id)).borrow();
+            let pool = &node.alloc;
+            assert!(node.inputs.iter().all(|q| q.uses_pool(pool)), "node {id}");
+            assert!(node.outputs.iter().all(|q| q.uses_pool(pool)), "node {id}");
+            assert_eq!(node.outputs[0].channel_data(0)[0], 1., "node {id}");
+        }
+    }
+
+    #[test]
+    fn group_plan_keeps_merged_render_groups_apart_in_buffers() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_grouped_node(&mut graph, 0, 0);
+        add_grouped_node(&mut graph, 1, 0);
+        add_grouped_node(&mut graph, 2, 5);
+        add_audioparam(&mut graph, 1, 2);
+        add_edge(&mut graph, 2, 0);
+        graph.order_nodes();
+
+        // one merged group, still planned so edges between render groups copy
+        assert_eq!(graph.plan.groups.len(), 1);
+        assert_eq!(group_of(&graph, 2), 0);
     }
 
     #[test]
