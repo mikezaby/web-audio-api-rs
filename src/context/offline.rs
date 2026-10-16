@@ -148,7 +148,7 @@ impl OfflineAudioContext {
     /// [`BaseAudioContext::set_render_group`]. 0 and 1 both render on the calling thread alone.
     /// Call this before rendering starts.
     pub fn set_render_threads(&self, threads: usize) {
-        self.base.set_render_threads(threads);
+        self.base.set_render_threads(threads, None);
     }
 
     /// Given the current connections and scheduled changes, starts rendering audio.

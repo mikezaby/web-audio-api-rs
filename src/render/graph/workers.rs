@@ -8,7 +8,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -67,6 +67,9 @@ impl std::fmt::Debug for Workers {
 impl Workers {
     /// Spawn `helpers` threads, which wait for work until dropped
     ///
+    /// With `real_time_frames`, the audio callback size in frames, the helpers ask for real-time
+    /// priority like the audio callback thread. Offline rendering passes `None`.
+    ///
     /// # Panics
     ///
     /// Panics when the operating system cannot spawn a thread.
@@ -74,6 +77,7 @@ impl Workers {
         helpers: usize,
         sample_rate: f32,
         event_sender: &Sender<EventDispatch>,
+        real_time_frames: Option<usize>,
     ) -> Self {
         let (queue, work) = crossbeam_channel::bounded(MAX_GROUPS + helpers);
         let shared = Arc::new(Shared {
@@ -86,7 +90,6 @@ impl Workers {
             remaining: AtomicUsize::new(0),
         });
 
-        // ponytail: helpers run at normal priority, real-time priority comes with stage B step 3
         let handles = (1..=helpers)
             .map(|i| {
                 let queue = queue.clone();
@@ -95,7 +98,12 @@ impl Workers {
                 let event_sender = event_sender.clone();
                 std::thread::Builder::new()
                     .name(format!("web-audio-render-{i}"))
-                    .spawn(move || helper(&queue, &work, &shared, sample_rate, event_sender))
+                    .spawn(move || {
+                        if let Some(frames) = real_time_frames {
+                            promote_to_real_time(frames, sample_rate);
+                        }
+                        helper(&queue, &work, &shared, sample_rate, event_sender);
+                    })
                     .expect("Unable to spawn render thread")
             })
             .collect();
@@ -209,6 +217,25 @@ fn work(
         }
     }
     remaining.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Give the calling helper real-time priority, or warn once and carry on at normal priority
+fn promote_to_real_time(frames: usize, sample_rate: f32) {
+    static WARNED: Once = Once::new();
+
+    // buffer sizes and sample rates are far below u32::MAX
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let promoted = audio_thread_priority::promote_current_thread_to_real_time(
+        frames as u32,
+        sample_rate as u32,
+    );
+    match promoted {
+        // the thread keeps the priority until it exits
+        Ok(_) => log::debug!("Render helper runs at real-time priority"),
+        Err(e) => WARNED.call_once(|| {
+            log::warn!("Render helpers run at normal priority, real-time priority refused: {e}");
+        }),
+    }
 }
 
 /// Main loop of a helper thread
