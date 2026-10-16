@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 5 and stage B steps 1 to 4 done on `perf/parallel-render`; the stage A exit checks through `node-web-audio-api`, the Pi numbers and stage C remain.
+Status: stage A steps 1 to 5 and stage B steps 1 to 4 done on `perf/parallel-render`, stage C steps 1 to 3 on `perf/render-groups` in `node-web-audio-api`; the WPT checks, the Pi numbers and stage C step 4 remain.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -253,6 +253,15 @@ Work in the `node-web-audio-api` fork (`~/projects/blibliki/node-web-audio-api`,
 4. Check the polling from `ae48481` (render side 30 us, worker side 50 us) with several render thread and worker pairs on four cores.
 
 Exit: WPT AudioWorklet results match base, and the Blibliki recipes that failed gate 1 reach clock speed 1.0 on the Pi.
+
+Steps 1 to 3 are done on `perf/render-groups` in `node-web-audio-api` (worktree `.worktrees/render-groups`), on top of `ae48481` plus the idle Worker fix (`c8fcd74`), building against this branch through the path dependency.
+Each context keeps one process call channel per render group; the AudioWorklet starts one global scope Worker per channel, which loads every module added so far, and a scope creates a processor only once its pending module imports finished.
+`tests/render-groups.spec.js` covers separate scopes, identical output and modules added later; the mocha suite passes.
+
+Measured with `examples/render-groups-benchmark.js` (8 tracks of 8 JS worklet voices, 5 seconds offline, M1 Pro), with 8 times the DSP of one voice per call: 1.78 s on one thread, 1.06 s on 2 threads with 2 groups, 0.64 s on 4 threads with 4 groups, 0.98 s on 4 threads with 8 groups.
+With a light voice the call overhead dominates: 0.56 s on one thread, 0.38 s on 4 threads with 4 groups.
+A render thread and the Worker of the group it renders wait on each other, so a pair takes about two cores, and with more groups than threads a Worker goes cold between its bursts.
+So keep groups at most equal to render threads, and threads at most half the cores: on the Pi, about 2 groups on 2 threads for a worklet-heavy instrument, which changes stage D from one group per track to the tracks spread over the groups.
 
 ### Stage D: Blibliki uses it
 
