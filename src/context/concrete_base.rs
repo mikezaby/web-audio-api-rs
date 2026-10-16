@@ -8,7 +8,7 @@ use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
 use crate::message::ControlMessage;
 use crate::node::{AudioDestinationNode, AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::AudioParam;
-use crate::render::graph::workers::Workers;
+use crate::render::graph::workers::{RealTime, Workers};
 use crate::render::AudioProcessor;
 use crate::spatial::AudioListenerParams;
 
@@ -417,15 +417,15 @@ impl ConcreteBaseAudioContext {
 
     /// Render groups on `threads` threads, the render thread included
     ///
-    /// The helpers are spawned here, so the render thread never spawns threads. With
-    /// `real_time_frames`, the callback size in frames, they run at real-time priority.
-    pub(super) fn set_render_threads(&self, threads: usize, real_time_frames: Option<usize>) {
+    /// The helpers are spawned here, so the render thread never spawns threads. With `real_time`
+    /// they run like the audio callback thread.
+    pub(super) fn set_render_threads(&self, threads: usize, real_time: Option<RealTime>) {
         let workers = (threads > 1).then(|| {
             Box::new(Workers::spawn(
                 threads - 1,
                 self.sample_rate(),
                 &self.inner.event_send,
-                real_time_frames,
+                real_time,
             ))
         });
         self.send_control_msg(ControlMessage::SetRenderWorkers { workers });

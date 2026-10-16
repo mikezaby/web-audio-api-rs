@@ -10,6 +10,7 @@ use cpal::{
 };
 use crossbeam_channel::Receiver;
 
+use super::workgroup::AudioWorkgroup;
 use super::{
     AudioBackendError, AudioBackendErrorKind, AudioBackendManager, BackendResult, RenderThreadInit,
 };
@@ -194,6 +195,7 @@ pub(crate) struct CpalBackend {
     sample_rate: f32,
     number_of_channels: usize,
     sink_id: String,
+    workgroup: Option<Arc<AudioWorkgroup>>,
 }
 
 impl AudioBackendManager for CpalBackend {
@@ -246,6 +248,19 @@ impl AudioBackendManager for CpalBackend {
                 .map_err(|e| map_cpal_error("output_device_name", e))?
                 .to_string()
         );
+
+        #[cfg(target_os = "macos")]
+        let workgroup = device
+            .id()
+            .ok()
+            .and_then(|id| AudioWorkgroup::for_device_uid(id.id()))
+            .map(Arc::new);
+        #[cfg(target_os = "macos")]
+        if workgroup.is_none() {
+            log::debug!("Output device has no audio workgroup for render helpers");
+        }
+        #[cfg(not(target_os = "macos"))]
+        let workgroup = None;
 
         let default_device_config = device
             .default_output_config()
@@ -379,6 +394,7 @@ impl AudioBackendManager for CpalBackend {
             sample_rate,
             number_of_channels,
             sink_id: options.sink_id,
+            workgroup,
         })
     }
 
@@ -529,6 +545,7 @@ impl AudioBackendManager for CpalBackend {
             sample_rate,
             number_of_channels,
             sink_id: options.sink_id,
+            workgroup: None,
         };
 
         Ok((backend, receiver))
@@ -575,6 +592,10 @@ impl AudioBackendManager for CpalBackend {
 
     fn sink_id(&self) -> &str {
         self.sink_id.as_str()
+    }
+
+    fn render_workgroup(&self) -> Option<Arc<AudioWorkgroup>> {
+        self.workgroup.clone()
     }
 
     fn enumerate_devices_sync() -> BackendResult<Vec<MediaDeviceInfo>>

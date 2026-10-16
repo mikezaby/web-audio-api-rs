@@ -7,7 +7,7 @@
 - Fix: `AudioBufferSourceNode` could hang the render thread when wrapping extremely narrow loops
 - Fix: `AudioBufferSourceNode` could panic at the loop boundary
 - Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering
-- Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum
+- Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum. Real-time helpers get real-time priority and, on macOS, join the output device's audio workgroup
 
 ## Version 1.7.0 (2026-08-06)
 

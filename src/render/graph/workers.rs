@@ -17,6 +17,7 @@ use super::groups::GroupPlan;
 use super::Graph;
 use crate::context::AudioNodeId;
 use crate::events::EventDispatch;
+use crate::io::workgroup::AudioWorkgroup;
 use crate::render::{AudioWorkletGlobalScope, NodeCollection};
 
 /// Queue entry that stops a helper thread
@@ -48,6 +49,15 @@ struct Shared {
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
+/// How helpers of a real-time context run
+#[derive(Clone, Debug)]
+pub(crate) struct RealTime {
+    /// Audio callback size in frames, for the real-time scheduling period
+    pub frames: usize,
+    /// Workgroup of the output device's IO thread, for the helpers to join
+    pub workgroup: Option<Arc<AudioWorkgroup>>,
+}
+
 /// Helper render threads, installed with `Graph::set_workers`
 pub(crate) struct Workers {
     queue: Sender<usize>,
@@ -67,8 +77,8 @@ impl std::fmt::Debug for Workers {
 impl Workers {
     /// Spawn `helpers` threads, which wait for work until dropped
     ///
-    /// With `real_time_frames`, the audio callback size in frames, the helpers ask for real-time
-    /// priority like the audio callback thread. Offline rendering passes `None`.
+    /// With `real_time`, the helpers ask for real-time priority and join the device workgroup,
+    /// like the audio callback thread. Offline rendering passes `None`.
     ///
     /// # Panics
     ///
@@ -77,7 +87,7 @@ impl Workers {
         helpers: usize,
         sample_rate: f32,
         event_sender: &Sender<EventDispatch>,
-        real_time_frames: Option<usize>,
+        real_time: Option<RealTime>,
     ) -> Self {
         let (queue, work) = crossbeam_channel::bounded(MAX_GROUPS + helpers);
         let shared = Arc::new(Shared {
@@ -96,12 +106,16 @@ impl Workers {
                 let work = work.clone();
                 let shared = Arc::clone(&shared);
                 let event_sender = event_sender.clone();
+                let real_time = real_time.clone();
                 std::thread::Builder::new()
                     .name(format!("web-audio-render-{i}"))
                     .spawn(move || {
-                        if let Some(frames) = real_time_frames {
-                            promote_to_real_time(frames, sample_rate);
-                        }
+                        let workgroup = real_time.as_ref().and_then(|rt| rt.workgroup.clone());
+                        // keeps the membership until the helper exits
+                        let _member = real_time.as_ref().map(|rt| {
+                            promote_to_real_time(rt.frames, sample_rate);
+                            join_workgroup(workgroup.as_deref())
+                        });
                         helper(&queue, &work, &shared, sample_rate, event_sender);
                     })
                     .expect("Unable to spawn render thread")
@@ -236,6 +250,22 @@ fn promote_to_real_time(frames: usize, sample_rate: f32) {
             log::warn!("Render helpers run at normal priority, real-time priority refused: {e}");
         }),
     }
+}
+
+/// Join the device workgroup with the calling helper, or warn once
+///
+/// Without it, macOS runs real-time helpers on efficiency cores.
+fn join_workgroup(workgroup: Option<&AudioWorkgroup>) -> Option<impl Sized + '_> {
+    static WARNED: Once = Once::new();
+
+    let member = workgroup?.join();
+    match member {
+        Some(_) => log::debug!("Render helper joined the audio workgroup"),
+        None => {
+            WARNED.call_once(|| log::warn!("Render helpers could not join the audio workgroup"))
+        }
+    }
+    member
 }
 
 /// Main loop of a helper thread
