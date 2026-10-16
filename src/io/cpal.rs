@@ -249,14 +249,15 @@ impl AudioBackendManager for CpalBackend {
                 .to_string()
         );
 
+        // only for render helpers: the lookup slows down every stream start
         #[cfg(target_os = "macos")]
-        let workgroup = device
-            .id()
-            .ok()
+        let workgroup = (options.render_threads > 1)
+            .then(|| device.id().ok())
+            .flatten()
             .and_then(|id| AudioWorkgroup::for_device_uid(id.id()))
             .map(Arc::new);
         #[cfg(target_os = "macos")]
-        if workgroup.is_none() {
+        if options.render_threads > 1 && workgroup.is_none() {
             log::debug!("Output device has no audio workgroup for render helpers");
         }
         #[cfg(not(target_os = "macos"))]
