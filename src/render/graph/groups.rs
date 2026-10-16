@@ -10,11 +10,13 @@
 //!   strongly connected components of the group graph). Edges cleared by a cycle breaker are gone
 //!   by then, so they do not count.
 //!
-//! Edges between groups go through mailboxes, so no buffer is shared between groups.
+//! Each render group has its own buffer pool, and every edge between two render groups copies:
+//! through a mailbox between merged groups, straight into the other pool within one. So a buffer
+//! never leaves its render group, however the groups merge now or split later.
 
 use super::Graph;
 use crate::context::AudioNodeId;
-use crate::render::{Alloc, AudioRenderQuantum, NodeCollection, QuantumCopy};
+use crate::render::{AudioRenderQuantum, NodeCollection, QuantumCopy};
 
 /// Carries one edge between render groups
 ///
@@ -37,14 +39,14 @@ impl Mailbox {
         self.written = true;
     }
 
-    pub fn deliver(&mut self, nodes: &NodeCollection, alloc: &Alloc) {
+    pub fn deliver(&mut self, nodes: &NodeCollection) {
         if !std::mem::take(&mut self.written) {
             return;
         }
 
         let mut node = nodes.get_unchecked(self.to).borrow_mut();
         node.has_inputs_connected = true;
-        let signal = self.quantum.to_quantum(alloc);
+        let signal = self.quantum.to_quantum(&node.alloc);
         let channel_config = node.channel_config.clone();
         node.inputs[self.input].add(&signal, &channel_config);
     }
@@ -68,7 +70,7 @@ pub(super) struct Group {
 /// How the graph splits into render groups, rebuilt with the node order
 #[derive(Debug, Default)]
 pub(super) struct GroupPlan {
-    /// Empty when the whole graph renders as one group
+    /// Empty when every node is in render group 0
     pub groups: Vec<Group>,
     /// Group indices in dependency order
     pub order: Vec<usize>,
@@ -247,12 +249,6 @@ impl Graph {
             }
             plan.slot[v] = plan.slot[root];
         }
-        if count == 1 {
-            plan.groups.clear();
-            plan.mailboxes.clear();
-            return;
-        }
-
         plan.groups.resize_with(count, Group::default);
         for group in &mut plan.groups {
             group.ordered.clear();

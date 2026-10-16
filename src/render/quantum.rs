@@ -9,6 +9,7 @@ use crate::assert_valid_number_of_channels;
 use crate::{MAX_CHANNELS, RENDER_QUANTUM_SIZE};
 
 // object pool for `AudioRenderQuantumChannel`s, only allocate if the pool is empty
+#[derive(Clone)]
 pub(crate) struct Alloc {
     inner: Rc<AllocInner>,
 }
@@ -45,6 +46,19 @@ impl Alloc {
     pub fn silence(&self) -> AudioRenderQuantumChannel {
         AudioRenderQuantumChannel {
             data: Rc::clone(&self.inner.zeroes),
+            alloc: Rc::clone(&self.inner),
+        }
+    }
+
+    /// A channel from this pool holding a copy of `samples`
+    pub(crate) fn copy_of(
+        &self,
+        samples: &[f32; RENDER_QUANTUM_SIZE],
+    ) -> AudioRenderQuantumChannel {
+        let mut data = self.inner.allocate();
+        Rc::make_mut(&mut data).copy_from_slice(samples);
+        AudioRenderQuantumChannel {
+            data,
             alloc: Rc::clone(&self.inner),
         }
     }
@@ -588,6 +602,39 @@ impl AudioRenderQuantum {
     }
 }
 
+impl AudioRenderQuantum {
+    /// Deep copy into buffers from `alloc`, keeping silent and shared channels as such
+    pub(crate) fn copy_into(&self, alloc: &Alloc) -> Self {
+        let mut channels = ArrayVec::<AudioRenderQuantumChannel, MAX_CHANNELS>::new();
+        for (i, channel) in self.channels.iter().enumerate() {
+            let shared = self.channels[..i]
+                .iter()
+                .position(|other| Rc::ptr_eq(&other.data, &channel.data));
+            let copy = if channel.is_silent() {
+                alloc.silence()
+            } else if let Some(j) = shared {
+                channels[j].clone()
+            } else {
+                alloc.copy_of(&channel.data)
+            };
+            channels.push(copy);
+        }
+
+        Self {
+            channels,
+            single_valued: self.single_valued,
+        }
+    }
+
+    /// True when every channel buffer comes from `alloc`
+    #[cfg(test)]
+    pub(crate) fn uses_pool(&self, alloc: &Alloc) -> bool {
+        self.channels
+            .iter()
+            .all(|channel| Rc::ptr_eq(&channel.alloc, &alloc.inner))
+    }
+}
+
 /// How a [`QuantumCopy`] holds one channel
 #[derive(Clone, Copy, Debug)]
 enum ChannelCopy {
@@ -643,14 +690,7 @@ impl QuantumCopy {
             let channel = match *copy {
                 ChannelCopy::Silent => alloc.silence(),
                 ChannelCopy::SameAs(j) => channels[j].clone(),
-                ChannelCopy::Samples => {
-                    let mut data = alloc.inner.allocate();
-                    Rc::make_mut(&mut data).copy_from_slice(&self.data[i]);
-                    AudioRenderQuantumChannel {
-                        data,
-                        alloc: Rc::clone(&alloc.inner),
-                    }
-                }
+                ChannelCopy::Samples => alloc.copy_of(&self.data[i]),
             };
             channels.push(channel);
         }
@@ -1666,5 +1706,31 @@ mod tests {
         ));
         assert!(Rc::ptr_eq(&restored.channels[0].alloc, &other.inner));
         assert!(restored.channel_data(2).is_silent());
+    }
+
+    #[test]
+    fn test_copy_into_other_pool() {
+        let alloc = Alloc::with_capacity(2);
+        let mut samples = alloc.silence();
+        samples
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, s)| *s = i as f32);
+        let mut quantum = AudioRenderQuantum::from(samples);
+        quantum.set_number_of_channels(2); // channel 1 aliases channel 0
+        quantum.channels.push(alloc.silence());
+
+        let other = Alloc::with_capacity(2);
+        let copy = quantum.copy_into(&other);
+
+        assert!(copy.uses_pool(&other));
+        assert_eq!(copy.number_of_channels(), 3);
+        assert_eq!(copy.channel_data(0)[5], 5.);
+        assert!(Rc::ptr_eq(&copy.channels[0].data, &copy.channels[1].data));
+        assert!(!Rc::ptr_eq(
+            &copy.channels[0].data,
+            &quantum.channels[0].data
+        ));
+        assert!(copy.channel_data(2).is_silent());
     }
 }
