@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 3 done on `perf/parallel-render`, step 4 next.
+Status: stage A steps 1 to 5 done on `perf/parallel-render`; the stage A exit checks through `node-web-audio-api` remain.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -127,8 +127,13 @@ The plan depends on these facts, checked on `main` at `03d0cb2`.
   - each group's initial dependency count and dependents;
   - the root groups;
   - the list of edges that cross groups.
-- Per-group state: its own node collection, its own buffer pool, its ordered node list, its incoming mailboxes and a list of nodes to drop.
-  With its own pool, no `Rc` ever leaves the group, which is what makes stage B sound.
+- Per-group state: its ordered node list, its incoming mailboxes and a list of nodes to drop.
+- Buffer pools are per render group id (the tag), not per merged group, and every edge between two render groups copies: through a mailbox between merged groups, straight into the other pool within a merged group.
+  So no `Rc` ever leaves its render group, however groups merge now or split later.
+  Pools per merged group could not promise that, because buffers held inside processors (the `DelayNode` ring buffer) cannot move to another pool when a merge splits.
+- The node collection stays one, indexed by node id.
+  The hidden-edge rule already keeps every node a processor touches (its own, its params, the listener params for a panner) in its merged group, so a thread only ever touches the nodes of its own group.
+  Lookups by id (`route_message`, the channel setters, `diagnostics`, the lifecycle code) stay as they are.
 - Edges between groups go through mailboxes.
   A mailbox is preallocated plain memory (a `Vec<f32>` per channel, a channel count and a silent flag), with no `Rc` inside.
   The producer copies its output into the mailbox after processing.
@@ -152,10 +157,12 @@ The plan depends on these facts, checked on `main` at `03d0cb2`.
 - Real-time priority for helpers on online contexts through the `audio_thread_priority` crate.
   If the system refuses (Linux without rtkit or `RLIMIT_RTPRIO`), carry on at normal priority and log once.
   Offline contexts use normal priority.
-- Soundness: group state holds `Rc`, so wrap it in `UnsafeCell` with `unsafe impl Sync` and a `SAFETY:` comment stating the invariant.
-  One thread touches a group between its trigger and its finish.
+- Soundness: the node collection, the group state and the mailboxes hold `Rc` and `RefCell`, so share them through a wrapper with `unsafe impl Sync` and a `SAFETY:` comment stating the invariant.
+  One thread touches a group's nodes, pools and drop list between its trigger and its finish.
   A group is triggered only after all its producers finish, ordered by `AcqRel` on the counters.
-  No `Rc` leaves its group (per-group pools, plain-float mailboxes, a `DelayNode`'s pair in one group).
+  No `Rc` leaves its render group (pools per render group, copies on every edge between render groups, a `DelayNode`'s pair in one render group).
+  The node collection does not change while groups render (removal waits for the end of the quantum, registration happens between quanta).
+- The merged group holding the destination renders on the callback thread, because the render thread keeps a clone of the destination output between callbacks (`buffer_offset` in `src/render/thread.rs`).
 - Panics: keep the per-node `catch_unwind`.
   A worker must still decrement its counters after a panic (use a drop guard) so the quantum completes.
 - Control messages and order rebuilds stay on the callback thread between quanta, as today.
@@ -172,9 +179,9 @@ Measure before committing any step that claims a speedup.
 2. The group plan in `order_nodes`: merge rules, per-group order, counts, roots.
    Unit tests in `src/render/graph/test.rs`: two-way dependency merge, three-group cycle merge, panner merge, filtered order stays topological.
 3. Mailboxes for edges between groups, and rendering groups one after another in dependency order.
-   Until step 5, registering or dropping a node while groups are in use rebuilds the whole plan.
-4. Per-group node collections and buffer pools.
-   `route_message`, the channel setters, `diagnostics` and the lifecycle code find nodes through the node to group map.
+   Registering or dropping a node while groups are in use rebuilds the whole plan.
+4. Buffer pools per render group, and copies on edges between render groups within a merged group.
+   Built differently from the first draft of this plan (per-group node collections), see "Rendering with groups".
 5. Deferred node removal.
 
 Exit:
@@ -186,6 +193,10 @@ Exit:
 
 Measured after step 3, M1 Pro, one thread, `cargo bench --bench parallel_groups`: 3.79 s without groups, 3.77 s with 8 groups, against 3.73 s on base.
 The small graphs in `my_benchmark` stay within 1% of base, and `bench_graph_reordering` within 2%.
+
+Measured after step 5, same machine: 3.58 s without groups, 3.60 s with 8 groups.
+Small graphs read up to 3% slower than base in plain builds, but within 1% with every function and branch target aligned (`RUSTFLAGS="-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5"` on both sides), so the rest is code layout.
+On Linux, the `iai` instruction counts (`cargo bench --no-default-features --features iai`) settle this without layout noise.
 
 ### Stage B: worker pool (about 1 to 2 weeks)
 
@@ -262,5 +273,5 @@ Up to that sum the voices do not depend on each other, so a heavy track can be s
   Four cores with four pairs may contend.
   Measure before raising the thread count past the core count.
 - Real-time priority on the Pi depends on rtkit and PipeWire limits.
-- Per-group node collections are indexed by node id, so each one is as long as the highest id.
-  That is fine for hundreds of nodes; revisit if it shows up in memory profiles.
+- The shared node collection interleaves nodes of different groups, so threads may write borrow flags on the same cache line at group boundaries.
+  Nodes are hundreds of bytes, so this should be rare; revisit if it shows up in stage B profiles.
