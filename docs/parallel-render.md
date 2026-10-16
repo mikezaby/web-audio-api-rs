@@ -284,6 +284,10 @@ On the Pi 5 it first lagged badly, for three causes found in turn (Showcase, 7 t
    Now the render thread blocks until a group is ready or the last one finished, and a Worker waits on its channel once its 50 us poll after a call ends.
 3. A sleeping Worker at normal priority could wait milliseconds to run when woken, which showed as peaks over 150%.
    On Linux the Workers now run at `SCHED_FIFO` 50, above the helpers (10) and below PipeWire (83).
+   Elsewhere they keep spinning for 3 ms after a call, as before: on macOS a waiting Worker at normal priority sometimes woke late, peaking at 480% of a callback against 85% spinning, and the M1 Pro has cores to spare.
+
+A run on the Pi then hung at `close()`: the render thread checked that the Worker had not exited, the Worker exited, and the call sent after the check never got a reply.
+The render thread now wakes every millisecond while it waits for a reply and gives up once the Worker exited.
 
 | Pi 5, Showcase                        | load     | peak      | late callbacks |
 | ------------------------------------- | -------- | --------- | -------------- |
