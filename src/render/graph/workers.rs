@@ -62,8 +62,12 @@ pub(crate) struct RealTime {
 pub(crate) struct Workers {
     queue: Sender<usize>,
     work: Receiver<usize>,
+    /// Woken by the thread that finishes the last group of a quantum
+    done: (Sender<()>, Receiver<()>),
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
+    // DEBUG(wait-experiment): WEB_AUDIO_GROUP_WAIT=spin waits as before, spinning
+    spin: bool,
 }
 
 impl std::fmt::Debug for Workers {
@@ -90,6 +94,7 @@ impl Workers {
         real_time: Option<RealTime>,
     ) -> Self {
         let (queue, work) = crossbeam_channel::bounded(MAX_GROUPS + helpers);
+        let done = crossbeam_channel::bounded(1);
         let shared = Arc::new(Shared {
             job: UnsafeCell::new(Job {
                 nodes: std::ptr::null(),
@@ -105,6 +110,7 @@ impl Workers {
                 let queue = queue.clone();
                 let work = work.clone();
                 let shared = Arc::clone(&shared);
+                let done = done.0.clone();
                 let event_sender = event_sender.clone();
                 let real_time = real_time.clone();
                 std::thread::Builder::new()
@@ -116,7 +122,7 @@ impl Workers {
                             promote_to_real_time(rt.frames, sample_rate);
                             join_workgroup(workgroup.as_deref())
                         });
-                        helper(&queue, &work, &shared, sample_rate, event_sender);
+                        helper(&queue, &work, &done, &shared, sample_rate, event_sender);
                     })
                     .expect("Unable to spawn render thread")
             })
@@ -125,8 +131,10 @@ impl Workers {
         Self {
             queue,
             work,
+            done,
             shared,
             handles,
+            spin: std::env::var("WEB_AUDIO_GROUP_WAIT").is_ok_and(|v| v == "spin"),
         }
     }
 
@@ -149,6 +157,8 @@ impl Workers {
         for (pending, group) in plan.pending.iter().zip(&plan.groups) {
             pending.store(group.dependencies, Ordering::Relaxed);
         }
+        // a token left by the last quantum would only wake the wait below once for nothing
+        let _ = self.done.1.try_recv();
         self.shared
             .remaining
             .store(plan.groups.len(), Ordering::Relaxed);
@@ -163,30 +173,38 @@ impl Workers {
             self.queue.send(group).unwrap();
         }
 
-        // Work too, until the last group finished. Never block, this is the audio callback.
+        // Work too, and sleep while no group is ready, until the last group finished. Spinning
+        // holds a core the helpers or the threads they wait for need: at real-time priority on
+        // Linux, `yield_now` gives the core to no thread of normal priority.
         let mut idle = 0_u32;
         while self.shared.remaining.load(Ordering::Acquire) > 0 {
-            match self.work.try_recv() {
-                Ok(group) => {
-                    idle = 0;
-                    work(
-                        nodes,
-                        plan,
-                        group,
-                        scope,
-                        &self.queue,
-                        &self.shared.remaining,
-                    );
-                }
-                Err(_) => {
-                    // ponytail: fixed spin then yield, tune on the Pi
+            let group = match self.work.try_recv() {
+                Ok(group) => Some(group),
+                Err(_) if self.spin => {
                     idle += 1;
                     if idle < 64 {
                         std::hint::spin_loop();
                     } else {
                         std::thread::yield_now();
                     }
+                    None
                 }
+                Err(_) => crossbeam_channel::select! {
+                    recv(self.work) -> group => group.ok(),
+                    recv(self.done.1) -> _ => None,
+                },
+            };
+            if let Some(group) = group {
+                idle = 0;
+                work(
+                    nodes,
+                    plan,
+                    group,
+                    scope,
+                    &self.queue,
+                    &self.done.0,
+                    &self.shared.remaining,
+                );
             }
         }
     }
@@ -210,6 +228,7 @@ fn work(
     group: usize,
     scope: &AudioWorkletGlobalScope,
     queue: &Sender<usize>,
+    done: &Sender<()>,
     remaining: &AtomicUsize,
 ) {
     // A panic of a processor is caught per node, so a panic here is a bug in the scheduler. Still
@@ -230,7 +249,10 @@ fn work(
             queue.send(dependent).unwrap();
         }
     }
-    remaining.fetch_sub(1, Ordering::AcqRel);
+    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        // a full channel already holds the wake-up
+        let _ = done.try_send(());
+    }
 }
 
 /// Give the calling helper real-time priority, or warn once and carry on at normal priority
@@ -272,6 +294,7 @@ fn join_workgroup(workgroup: Option<&AudioWorkgroup>) -> Option<impl Sized + '_>
 fn helper(
     queue: &Sender<usize>,
     work_queue: &Receiver<usize>,
+    done: &Sender<()>,
     shared: &Shared,
     sample_rate: f32,
     event_sender: Sender<EventDispatch>,
@@ -288,15 +311,16 @@ fn helper(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
     unsafe {
         // SAFETY: as for the render thread (`src/render/thread.rs`)
-        no_denormals::no_denormals(|| helper_loop(queue, work_queue, shared, &mut scope));
+        no_denormals::no_denormals(|| helper_loop(queue, work_queue, done, shared, &mut scope));
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    helper_loop(queue, work_queue, shared, &mut scope);
+    helper_loop(queue, work_queue, done, shared, &mut scope);
 }
 
 fn helper_loop(
     queue: &Sender<usize>,
     work_queue: &Receiver<usize>,
+    done: &Sender<()>,
     shared: &Shared,
     scope: &mut AudioWorkletGlobalScope,
 ) {
@@ -313,6 +337,6 @@ fn helper_loop(
         scope.current_time = job.current_time;
         // SAFETY: the quantum is running, see `Shared`
         let (nodes, plan) = unsafe { (&*job.nodes, &*job.plan) };
-        work(nodes, plan, group, scope, queue, &shared.remaining);
+        work(nodes, plan, group, scope, queue, done, &shared.remaining);
     }
 }
