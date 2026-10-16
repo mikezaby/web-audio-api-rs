@@ -1,6 +1,6 @@
 # Parallel render groups
 
-Status: stage A steps 1 to 5 done on `perf/parallel-render`; the stage A exit checks through `node-web-audio-api` remain.
+Status: stage A steps 1 to 5 done on `perf/parallel-render`, and a stage B prototype (steps 1 and 2, no real-time priority yet); the stage A exit checks through `node-web-audio-api` remain.
 Branch: `perf/parallel-render` in this clone (`origin` is upstream `orottier/web-audio-api-rs`, never push there).
 Written 2026-10-15 as a handover from the Blibliki repository (`~/projects/blibliki/blibliki`).
 
@@ -217,6 +217,10 @@ Exit:
   `cargo run --release --example parallel_groups` plays the same graph in real time and prints clock speed, load and underruns.
   A small graph with one group is at most 2% slower than upstream.
 - On the Pi, online at PipeWire quantum 1024, no underruns.
+
+Measured with the prototype (steps 1 and 2), M1 Pro, `cargo bench --bench parallel_groups`: 3.59 s without groups, 3.68 s with 8 groups on one thread, 1.94 s on 2 threads (1.85x), 1.16 s on 4 threads (3.10x).
+In real time at 64 voices per track, 4 threads halve the average load (45% against 89%) but underruns stay (5% of callbacks against 3 to 7% before), with peaks up to 350% of the callback budget.
+Helpers at normal priority get preempted while the callback thread waits for their group, so step 3 comes next.
 
 ### Stage C: one JS worklet worker per group, in `node-web-audio-api`
 
