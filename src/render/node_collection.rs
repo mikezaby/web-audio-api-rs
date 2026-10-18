@@ -86,6 +86,12 @@ impl NodeCollection {
             .filter_map(|(i, v)| v.as_mut().map(|m| (AudioNodeId(i as u64), m)))
     }
 
+    /// Upper bound of the node ids, for state indexed by id
+    #[inline(always)]
+    pub fn id_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     #[inline(always)]
     pub fn contains(&self, index: AudioNodeId) -> bool {
         self.nodes[index.0 as usize].is_some()
