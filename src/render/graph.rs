@@ -132,6 +132,15 @@ impl Node {
     }
 }
 
+/// Where the topological sort is with a node
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visit {
+    New,
+    /// On the path being visited, a cycle if it shows up again
+    OnPath,
+    Done,
+}
+
 /// The audio graph
 pub(crate) struct Graph {
     /// Processing Nodes
@@ -143,8 +152,8 @@ pub(crate) struct Graph {
     reclaim_id_channel: llq::Producer<AudioNodeId>,
     /// Topological ordering of the nodes
     ordered: Vec<AudioNodeId>,
-    /// Topological sorting helper
-    marked: AudioNodeIdSet,
+    /// Topological sorting helper, the visit state of each node id
+    marked: Vec<Visit>,
     /// Topological sorting helper
     marked_temp: Vec<AudioNodeId>,
     /// Topological sorting helper
@@ -175,7 +184,7 @@ impl Graph {
             pools: vec![(0, Alloc::with_capacity(64))],
             reclaim_id_channel,
             ordered: vec![],
-            marked: AudioNodeIdSet::default(),
+            marked: vec![],
             marked_temp: vec![],
             in_cycle: AudioNodeIdSet::default(),
             cycle_breakers: vec![],
@@ -383,14 +392,15 @@ impl Graph {
     fn visit(
         &self,
         node_id: AudioNodeId,
-        marked: &mut AudioNodeIdSet,
+        marked: &mut [Visit],
         marked_temp: &mut Vec<AudioNodeId>,
         ordered: &mut Vec<AudioNodeId>,
         in_cycle: &mut AudioNodeIdSet,
         cycle_breakers: &mut Vec<AudioNodeId>,
     ) -> bool {
         // If this node is in the cycle detection list, it is part of a cycle!
-        if let Some(pos) = marked_temp.iter().position(|&m| m == node_id) {
+        if marked[node_id.0 as usize] == Visit::OnPath {
+            let pos = marked_temp.iter().position(|&m| m == node_id).unwrap();
             // check if we can find some node that can break the cycle
             let cycle_breaker_node = marked_temp
                 .iter()
@@ -414,13 +424,12 @@ impl Graph {
         }
 
         // Do not visit nodes multiple times
-        if marked.contains(&node_id) {
+        if marked[node_id.0 as usize] == Visit::Done {
             return false;
         }
 
-        // Add node to the visited list
-        marked.insert(node_id);
         // Add node to the current cycle detection list
+        marked[node_id.0 as usize] = Visit::OnPath;
         marked_temp.push(node_id);
 
         // Visit outgoing nodes, and call `visit` on them recursively
@@ -447,8 +456,10 @@ impl Graph {
         // Then add this node to the ordered list
         ordered.push(node_id);
 
-        // Finished visiting all nodes in this leg, clear the current cycle detection list
-        marked_temp.retain(|marked| *marked != node_id);
+        // Finished visiting all nodes in this leg, the node is on top of the cycle detection list
+        debug_assert_eq!(marked_temp.last(), Some(&node_id));
+        marked_temp.pop();
+        marked[node_id.0 as usize] = Visit::Done;
 
         false
     }
@@ -482,6 +493,7 @@ impl Graph {
             // Clear previous administration
             ordered.clear();
             marked.clear();
+            marked.resize(self.nodes.id_count(), Visit::New);
             marked_temp.clear();
             in_cycle.clear();
             cycle_breakers.clear();
