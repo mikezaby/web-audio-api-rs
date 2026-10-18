@@ -617,6 +617,15 @@ impl AudioRenderQuantum {
 
         self.mix(new_channels, interpretation);
 
+        // mix a copy of `other` only when its channel count differs
+        if other.number_of_channels() == new_channels {
+            self.channels
+                .iter_mut()
+                .zip(other.channels.iter())
+                .for_each(|(s, o)| s.add(o));
+            return;
+        }
+
         let mut other_mixed = other.clone();
         other_mixed.mix(new_channels, interpretation);
 
