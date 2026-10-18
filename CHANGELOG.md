@@ -7,6 +7,7 @@
 - Fix: PannerNode HRTF direction mapping of front/back and above/below
 - Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering
 - Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum. Real-time helpers get real-time priority and, on macOS, join the output device's audio workgroup. The render thread sleeps while it waits for the other threads
+- Improved `GainNode` performance with an a-rate gain
 
 ## Version 1.8.0 (2026-11-12)
 
