@@ -182,25 +182,29 @@ pub(crate) struct AudioParamEvent {
 // After this point, the queue should be considered sorted and no operations that
 // breaks the ordering should be done.
 #[derive(Debug, Default)]
+/// Events sorted by time, those at the same time in insertion order
 struct AudioParamEventTimeline {
     inner: Vec<AudioParamEvent>,
-    dirty: bool,
 }
 
 impl AudioParamEventTimeline {
     fn new() -> Self {
         Self {
             inner: Vec::with_capacity(32),
-            dirty: false,
         }
     }
 
+    // Insert in place rather than push and sort: a sort allocates scratch space in the render
+    // thread for long timelines
     fn push(&mut self, item: AudioParamEvent) {
-        self.dirty = true;
-        self.inner.push(item);
+        // after the events at the same time, where a stable sort would put it
+        let index = self
+            .inner
+            .partition_point(|queued| queued.time <= item.time);
+        self.inner.insert(index, item);
     }
 
-    // `pop` and `retain` preserve order so they don't make the queue dirty
+    // `pop` and `retain` preserve order
     fn pop(&mut self) -> Option<AudioParamEvent> {
         if !self.inner.is_empty() {
             Some(self.inner.remove(0))
@@ -228,31 +232,12 @@ impl AudioParamEventTimeline {
         self.inner.is_empty()
     }
 
-    fn unsorted_peek(&self) -> Option<&AudioParamEvent> {
-        self.inner.first()
-    }
-
-    // panic if dirty, we are doing something wrong here
     fn peek(&self) -> Option<&AudioParamEvent> {
-        assert!(
-            !self.dirty,
-            "`AudioParamEventTimeline`: Invalid `.peek()` call, the queue is dirty"
-        );
         self.inner.first()
     }
 
     fn next(&self) -> Option<&AudioParamEvent> {
-        assert!(
-            !self.dirty,
-            "`AudioParamEventTimeline`: Invalid `.next()` call, the queue is dirty"
-        );
         self.inner.get(1)
-    }
-
-    fn sort(&mut self) {
-        self.inner
-            .sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
-        self.dirty = false;
     }
 
     fn iter(&mut self) -> Iter<'_, AudioParamEvent> {
@@ -821,13 +806,9 @@ impl AudioParamProcessor {
         // handle CancelScheduledValues events
         // cf. https://www.w3.org/TR/webaudio/#dom-audioparam-cancelscheduledvalues
         if event.event_type == AudioParamEventType::CancelScheduledValues {
-            // peek current event before inserting new events, and possibly sort
-            // the queue, we need that for checking that we are (or not) in the middle
-            // of a ramp when handling `CancelScheduledValues`
-            // @note - probably not robust enough in some edge cases where the
-            // event is not the first received at this tick (`SetValueCurveAtTime`
-            // and `CancelAndHold` need to sort the queue)
-            let some_current_event = self.event_timeline.unsorted_peek();
+            // peek current event, we need that for checking that we are (or not)
+            // in the middle of a ramp when handling `CancelScheduledValues`
+            let some_current_event = self.event_timeline.peek();
 
             match some_current_event {
                 None => (),
@@ -887,8 +868,6 @@ impl AudioParamProcessor {
             let mut e2: Option<&mut AudioParamEvent> = None;
             let mut t1 = f64::MIN;
             let mut t2 = f64::MAX;
-            // we need a sorted timeline here to find siblings
-            self.event_timeline.sort();
 
             for queued in self.event_timeline.iter_mut() {
                 // closest before cancel time: if several events at same time,
@@ -1055,7 +1034,6 @@ impl AudioParamProcessor {
         }
 
         self.event_timeline.push(event);
-        self.event_timeline.sort();
     }
 
     // https://www.w3.org/TR/webaudio/%23dom-audioparam-linearramptovalueattime#dom-audioparam-setvalueattime
