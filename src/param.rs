@@ -748,29 +748,37 @@ impl AudioParamProcessor {
             } else {
                 // a-rate processing and input non-zero
                 output.set_single_valued(false);
-                *output = input.clone();
-                output.channel_data_mut(0).iter_mut().for_each(|o| {
-                    *o += value;
+                // a param input is mono, written into the output rather than copied first
+                output.force_mono();
+                output
+                    .channel_data_mut(0)
+                    .make_mut_for_overwrite()
+                    .iter_mut()
+                    .zip(input.channel_data(0).iter())
+                    .for_each(|(o, i)| {
+                        *o = i + value;
 
-                    if o.is_nan() {
-                        *o = self.default_value;
-                    } else {
-                        // do not use `clamp` because it has extra branches for NaN or when max < min
-                        *o = o.max(self.min_value).min(self.max_value);
-                    }
-                });
+                        if o.is_nan() {
+                            *o = self.default_value;
+                        } else {
+                            // do not use `clamp` because it has extra branches for NaN or when max < min
+                            *o = o.max(self.min_value).min(self.max_value);
+                        }
+                    });
             }
         } else {
             // a-rate processing
-            *output = input.clone();
             output.set_single_valued(false);
+            // a param input is mono, written into the output rather than copied first
+            output.force_mono();
 
             output
                 .channel_data_mut(0)
+                .make_mut_for_overwrite()
                 .iter_mut()
-                .zip(self.buffer.iter())
-                .for_each(|(o, p)| {
-                    *o += p;
+                .zip(input.channel_data(0).iter().zip(self.buffer.iter()))
+                .for_each(|(o, (i, p))| {
+                    *o = i + p;
 
                     if o.is_nan() {
                         *o = self.default_value;

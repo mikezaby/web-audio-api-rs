@@ -179,25 +179,35 @@ impl AudioProcessor for GainRenderer {
             }
         }
 
-        *output = input.clone();
-
-        if gain.len() == 1 {
-            let g = gain[0];
-
-            output.channels_mut().iter_mut().for_each(|channel| {
-                channel.iter_mut().for_each(|o| *o *= g);
-            });
-        } else {
-            output.channels_mut().iter_mut().for_each(|channel| {
-                // an a-rate gain is a full quantum here, a plain zip vectorises
-                channel
-                    .iter_mut()
-                    .zip(gain.iter())
-                    .for_each(|(o, g)| *o *= g);
-            });
+        // write the product into the output, rather than copy the input there and scale it
+        output.set_number_of_channels(input.number_of_channels());
+        let identical = input.all_channels_identical();
+        let (first, rest) = output.channels_mut().split_first_mut().unwrap();
+        scale(first.make_mut_for_overwrite(), input.channel_data(0), gain);
+        for (o, i) in rest.iter_mut().zip(&input.channels()[1..]) {
+            // an upmixed mono input holds one buffer in every channel: scale it once
+            if identical {
+                o.clone_from(first);
+            } else {
+                scale(o.make_mut_for_overwrite(), i, gain);
+            }
         }
 
         false
+    }
+}
+
+/// `output = input * gain`, the gain a single value or a full quantum
+fn scale(output: &mut [f32], input: &[f32], gain: &[f32]) {
+    if let [g] = gain {
+        output.iter_mut().zip(input).for_each(|(o, i)| *o = i * g);
+    } else {
+        // an a-rate gain is a full quantum here, a plain zip vectorises
+        output
+            .iter_mut()
+            .zip(input)
+            .zip(gain)
+            .for_each(|((o, i), g)| *o = i * g);
     }
 }
 

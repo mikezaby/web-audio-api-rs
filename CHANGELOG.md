@@ -10,7 +10,7 @@
 - Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum. Real-time helpers get real-time priority and, on macOS, join the output device's audio workgroup. The render thread sleeps while it waits for the other threads
 - Fix: `setTargetAtTime` and `setValueCurveAtTime` starting after the current render quantum no longer extrapolate the param value before their start time
 - Improved performance: an a-rate `AudioParam` whose values are equal over a render quantum (a constant input or an automation at rest) is passed to its node as a single value
-- Improved `GainNode` performance with an a-rate gain
+- Improved `GainNode` performance: an a-rate gain vectorises, and the product is written into the output instead of copying the input there first
 - Improved performance: a `ConvolverNode` given a new buffer no longer renders a silent tail for the impulse length before its input is heard
 - Improved `ConvolverNode` performance: a non-uniform partitioned convolution spreads the work of its long partitions over the render quanta of a block, so the cost per quantum is lower and even (a 3 s stereo impulse response went from 44 to 10 us per quantum on an M1, the worst quantum from 353 to 141 us). The `fft-convolver` dependency is gone
 - Improved performance of a-rate `exponentialRampToValueAtTime` and `setTargetAtTime`: samples follow from the first one by a constant factor instead of a `powf` or `exp` each. Exponential ramps are computed in f64 and now land within one ULP of the spec formula, where they could be a few ULP off
