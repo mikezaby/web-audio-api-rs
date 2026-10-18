@@ -448,17 +448,39 @@ impl AudioProcessor for OscillatorRenderer {
                 });
             }
         } else {
-            channel_data
-                .iter_mut()
-                .zip(frequency_values.iter().cycle())
-                .zip(detune_values.iter().cycle())
-                .for_each(|((output, &freq), &detune)| {
-                    let computed_freq = get_computed_freq(freq, detune);
-                    let phase_incr = computed_freq / sample_rate;
-                    let outside_nyquist = computed_freq.abs() >= nyquist;
+            let fully_active = self.started
+                && self.start_time <= scope.current_time
+                && self.stop_time >= next_block_time;
+            // a moving frequency with a constant detune: its factor is the same for every sample
+            let detune_factor =
+                (detune_values.len() == 1).then(|| (f64::from(detune_values[0]) / 1200.).exp2());
+
+            for (i, output) in channel_data.iter_mut().enumerate() {
+                let freq = frequency_values[i.min(frequency_values.len() - 1)];
+                let computed_freq = match detune_factor {
+                    Some(detune_factor) => f64::from(freq) * detune_factor,
+                    None => get_computed_freq(freq, detune_values[i]),
+                };
+                let phase_incr = computed_freq / sample_rate;
+                let outside_nyquist = computed_freq.abs() >= nyquist;
+
+                if fully_active {
+                    // `generate_sample` without the start and stop checks
+                    *output = if outside_nyquist {
+                        0.
+                    } else {
+                        self.generate_waveform_sample(phase_incr)
+                    };
+                    self.phase = if outside_nyquist {
+                        Self::unroll_phase_unbounded(self.phase + phase_incr)
+                    } else {
+                        Self::unroll_phase(self.phase + phase_incr)
+                    };
+                } else {
                     current_time =
-                        self.generate_sample(output, outside_nyquist, phase_incr, current_time, dt)
-                });
+                        self.generate_sample(output, outside_nyquist, phase_incr, current_time, dt);
+                }
+            }
         }
 
         if self.stop_time <= next_block_time {
