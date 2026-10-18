@@ -119,13 +119,22 @@ impl RenderThread {
         }
     }
 
+    /// Handle every pending control message, offline rendering applies them all at once
     #[inline(always)]
     fn handle_control_messages(&mut self) {
+        self.handle_control_messages_up_to(usize::MAX);
+    }
+
+    #[inline(always)]
+    fn handle_control_messages_up_to(&mut self, limit: usize) {
         if self.receiver.is_none() {
             return;
         }
 
-        while let Ok(msg) = self.receiver.as_ref().unwrap().try_recv() {
+        for _ in 0..limit {
+            let Ok(msg) = self.receiver.as_ref().unwrap().try_recv() else {
+                return;
+            };
             let result = self.handle_control_message(msg);
             if result.is_break() {
                 return; // stop processing
@@ -478,7 +487,7 @@ impl RenderThread {
         }
 
         // handle addition/removal of nodes/edges
-        self.handle_control_messages();
+        self.handle_control_messages_up_to(MAX_CONTROL_MESSAGES_PER_DRAIN);
 
         // if the thread is still booting, suspended, or shutting down, fill with silence
         if self.suspended || !self.graph.as_ref().is_some_and(Graph::is_active) {
@@ -533,7 +542,7 @@ impl RenderThread {
             }
 
             // handle addition/removal of nodes/edges
-            self.handle_control_messages();
+            self.handle_control_messages_up_to(MAX_CONTROL_MESSAGES_PER_DRAIN);
         }
     }
 
@@ -553,6 +562,9 @@ impl Drop for RenderThread {
         log::info!("Audio render thread has been dropped");
     }
 }
+
+/// Most control messages a real-time render thread handles between two render quanta
+pub(crate) const MAX_CONTROL_MESSAGES_PER_DRAIN: usize = 256;
 
 // Controls the polling frequency of the garbage collector thread.
 const GARBAGE_COLLECTOR_THREAD_TIMEOUT: Duration = Duration::from_millis(100);

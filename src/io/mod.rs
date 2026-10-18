@@ -117,10 +117,12 @@ pub(crate) fn thread_init() -> (ControlThreadInit, RenderThreadInit) {
     let stats = AudioStats::new();
 
     // Communication channel for ctrl msgs from the control thread to the render thread.
-    // Use a bounded channel for real-time safety. A maximum of 256 control messages (add/remove
-    // node, settings, ..) will be handled per render quantum. The control thread will block when
-    // the capacity is reached.
-    let (ctrl_msg_send, ctrl_msg_recv) = crossbeam_channel::bounded(256);
+    // Use a bounded channel for real-time safety. The control thread will block when the
+    // capacity is reached, until the render thread drains it in its next callback; building a
+    // node with its params takes several messages each, so the capacity takes a large patch
+    // without blocking. The render thread handles at most `MAX_CONTROL_MESSAGES_PER_DRAIN`
+    // between two render quanta, so a burst spreads over several.
+    let (ctrl_msg_send, ctrl_msg_recv) = crossbeam_channel::bounded(4096);
 
     // Communication channel for events from the render thread to the control thread.
     // Use a bounded channel for real-time safety. A maximum of 256 events (node ended, error, ..)
