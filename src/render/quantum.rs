@@ -117,6 +117,18 @@ impl AudioRenderQuantumChannel {
         Rc::make_mut(&mut self.data)
     }
 
+    /// The samples, for a caller that writes every one of them
+    ///
+    /// A buffer shared with another holder is swapped for one from the pool without copying what
+    /// it held, so the samples start out as garbage.
+    pub(crate) fn make_mut_for_overwrite(&mut self) -> &mut [f32; RENDER_QUANTUM_SIZE] {
+        if Rc::strong_count(&self.data) != 1 {
+            self.data = self.alloc.allocate();
+        }
+
+        Rc::make_mut(&mut self.data)
+    }
+
     /// `O(1)` check if this buffer is equal to the 'silence buffer'
     ///
     /// If this function returns false, it is still possible for all samples to be zero.
@@ -129,7 +141,16 @@ impl AudioRenderQuantumChannel {
         if self.is_silent() {
             *self = other.clone();
         } else if !other.is_silent() {
-            self.iter_mut().zip(other.iter()).for_each(|(a, b)| *a += b)
+            if Rc::strong_count(&self.data) == 1 {
+                self.iter_mut().zip(other.iter()).for_each(|(a, b)| *a += b);
+            } else {
+                // write the sum into a buffer of our own, rather than copy then add
+                let summand = Rc::clone(&self.data);
+                self.make_mut_for_overwrite()
+                    .iter_mut()
+                    .zip(summand.iter().zip(other.iter()))
+                    .for_each(|(o, (a, b))| *o = a + b);
+            }
         }
     }
 
@@ -609,7 +630,7 @@ impl AudioRenderQuantum {
     ///
     /// This is often the case for upmixed buffers. When all channels are identical, modifications
     /// only need to be applied once.
-    fn all_channels_identical(&self) -> bool {
+    pub(crate) fn all_channels_identical(&self) -> bool {
         let mut channels = self.channels.iter();
         let first = channels.next().unwrap();
         for c in channels {
