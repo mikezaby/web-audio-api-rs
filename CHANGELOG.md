@@ -20,6 +20,7 @@
 - New nodes reuse the input and output lists of removed ones instead of allocating them on the render thread
 - The control message channel of an `AudioContext` holds 4096 messages instead of 256, so building a large graph no longer blocks the control thread for a render callback per 256 messages; the render thread applies at most 256 between two render quanta
 - Improved `PeriodicWave` creation: the table is one inverse FFT instead of a sine and a cosine per sample and harmonic (17 ms to 0.15 ms for 513 coefficients on an M1), and the high harmonics are more accurate
+- `WaveShaperNode` builds its resamplers only for the oversample factor in use, on the control thread (creating one without oversampling went from 0.05 to 0.001 ms on an M1)
 
 ## Version 1.7.0 (2026-08-06)
 

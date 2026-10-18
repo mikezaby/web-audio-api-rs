@@ -225,7 +225,12 @@ impl WaveShaperNode {
     /// * `oversample` - the desired `OversampleType` variant
     pub fn set_oversample(&mut self, oversample: OverSampleType) {
         self.oversample = oversample;
-        self.registration.post_message(oversample);
+        // the resamplers are built here rather than on the render thread
+        let sample_rate = self.context().sample_rate() as usize;
+        self.registration.post_message(OversampleMessage {
+            oversample,
+            oversampler: Oversampler::new(oversample, 1, sample_rate),
+        });
     }
 }
 
@@ -346,6 +351,55 @@ impl Resampler {
     }
 }
 
+/// An up and a down resampler around the curve, for one oversample factor
+struct Oversampler {
+    channels: usize,
+    up: Resampler,
+    down: Resampler,
+}
+
+impl Oversampler {
+    fn new(oversample: OverSampleType, channels: usize, sample_rate: usize) -> Option<Self> {
+        let (up, down) = match oversample {
+            OverSampleType::None => return None,
+            OverSampleType::X2 => (
+                ResamplerConfig::upsample_x2(channels, sample_rate),
+                ResamplerConfig::downsample_x2(channels, sample_rate),
+            ),
+            OverSampleType::X4 => (
+                ResamplerConfig::upsample_x4(channels, sample_rate),
+                ResamplerConfig::downsample_x4(channels, sample_rate),
+            ),
+        };
+
+        Some(Self {
+            channels,
+            up: Resampler::new(up),
+            down: Resampler::new(down),
+        })
+    }
+
+    /// Apply `curve` to `output` at the oversampled rate
+    fn shape(&mut self, curve: &[f32], output: &mut AudioRenderQuantum) {
+        self.up.process(output.channels());
+        for channel in self.up.samples_out_mut().iter_mut() {
+            for s in channel.iter_mut() {
+                *s = apply_curve(curve, *s);
+            }
+        }
+
+        self.down.process(self.up.samples_out());
+        for (processed, output) in self.down.samples_out().iter().zip(output.channels_mut()) {
+            output.copy_from_slice(&processed[..]);
+        }
+    }
+}
+
+struct OversampleMessage {
+    oversample: OverSampleType,
+    oversampler: Option<Oversampler>,
+}
+
 /// Helper struct which regroups all parameters
 /// required to build `WaveShaperRenderer`
 struct RendererConfig {
@@ -363,18 +417,8 @@ struct WaveShaperRenderer {
     curve: Option<Vec<f32>>,
     /// Sample rate (equals to audio context sample rate)
     sample_rate: usize,
-    /// Number of channels used to build the up/down sampler X2
-    channels_x2: usize,
-    /// Number of channels used to build the up/down sampler X4
-    channels_x4: usize,
-    // up sampler configured to multiply by 2 the input signal
-    upsampler_x2: Resampler,
-    // up sampler configured to multiply by 4 the input signal
-    upsampler_x4: Resampler,
-    // down sampler configured to divide by 2 the upsampled signal
-    downsampler_x2: Resampler,
-    // down sampler configured to divide by 4 the upsampled signal
-    downsampler_x4: Resampler,
+    /// Resamplers for the oversample factor, none without oversampling
+    oversampler: Option<Oversampler>,
     // check if silence can be propagated, i.e. if curve if None or if
     // it's output value for zero signal is zero (i.e. < 1e-9)
     can_propagate_silence: bool,
@@ -400,84 +444,21 @@ impl AudioProcessor for WaveShaperRenderer {
         output.clone_from(input);
 
         if let Some(curve) = &self.curve {
-            match self.oversample {
-                OverSampleType::None => {
+            match &mut self.oversampler {
+                None => {
                     output.modify_channels(|channel| {
                         channel.iter_mut().for_each(|o| *o = apply_curve(curve, *o));
                     });
                 }
-                OverSampleType::X2 => {
-                    let channels = output.channels();
-
-                    // recreate up/down sampler if number of channels changed
-                    if channels.len() != self.channels_x2 {
-                        self.channels_x2 = channels.len();
-
-                        self.upsampler_x2 = Resampler::new(ResamplerConfig::upsample_x2(
-                            self.channels_x2,
-                            self.sample_rate,
-                        ));
-
-                        self.downsampler_x2 = Resampler::new(ResamplerConfig::downsample_x2(
-                            self.channels_x2,
-                            self.sample_rate,
-                        ));
+                Some(oversampler) => {
+                    let channels = output.number_of_channels();
+                    if oversampler.channels != channels {
+                        // ponytail: rebuilt on the render thread when the channel count changes,
+                        // build per channel count up front if that shows up
+                        *oversampler =
+                            Oversampler::new(self.oversample, channels, self.sample_rate).unwrap();
                     }
-
-                    self.upsampler_x2.process(channels);
-                    for channel in self.upsampler_x2.samples_out_mut().iter_mut() {
-                        for s in channel.iter_mut() {
-                            *s = apply_curve(curve, *s);
-                        }
-                    }
-
-                    self.downsampler_x2.process(self.upsampler_x2.samples_out());
-
-                    for (processed, output) in self
-                        .downsampler_x2
-                        .samples_out()
-                        .iter()
-                        .zip(output.channels_mut())
-                    {
-                        output.copy_from_slice(&processed[..]);
-                    }
-                }
-                OverSampleType::X4 => {
-                    let channels = output.channels();
-
-                    // recreate up/down sampler if number of channels changed
-                    if channels.len() != self.channels_x4 {
-                        self.channels_x4 = channels.len();
-
-                        self.upsampler_x4 = Resampler::new(ResamplerConfig::upsample_x4(
-                            self.channels_x4,
-                            self.sample_rate,
-                        ));
-
-                        self.downsampler_x4 = Resampler::new(ResamplerConfig::downsample_x4(
-                            self.channels_x4,
-                            self.sample_rate,
-                        ));
-                    }
-
-                    self.upsampler_x4.process(channels);
-
-                    for channel in self.upsampler_x4.samples_out_mut().iter_mut() {
-                        for s in channel.iter_mut() {
-                            *s = apply_curve(curve, *s);
-                        }
-                    }
-
-                    self.downsampler_x4.process(self.upsampler_x4.samples_out());
-
-                    for (processed, output) in self
-                        .downsampler_x4
-                        .samples_out()
-                        .iter()
-                        .zip(output.channels_mut())
-                    {
-                        output.copy_from_slice(&processed[..]);
-                    }
+                    oversampler.shape(curve, output);
                 }
             }
         }
@@ -487,8 +468,10 @@ impl AudioProcessor for WaveShaperRenderer {
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
-        if let Some(&oversample) = msg.downcast_ref::<OverSampleType>() {
-            self.oversample = oversample;
+        if let Some(msg) = msg.downcast_mut::<OversampleMessage>() {
+            self.oversample = msg.oversample;
+            // the replaced resamplers leave with the message, off the render thread
+            std::mem::swap(&mut self.oversampler, &mut msg.oversampler);
             return;
         }
 
@@ -524,29 +507,11 @@ impl WaveShaperRenderer {
             oversample,
         } = config;
 
-        let channels_x2 = 1;
-        let channels_x4 = 1;
-
-        let upsampler_x2 = Resampler::new(ResamplerConfig::upsample_x2(channels_x2, sample_rate));
-
-        let downsampler_x2 =
-            Resampler::new(ResamplerConfig::downsample_x2(channels_x2, sample_rate));
-
-        let upsampler_x4 = Resampler::new(ResamplerConfig::upsample_x4(channels_x2, sample_rate));
-
-        let downsampler_x4 =
-            Resampler::new(ResamplerConfig::downsample_x4(channels_x2, sample_rate));
-
         Self {
             oversample,
             curve: None,
             sample_rate,
-            channels_x2,
-            channels_x4,
-            upsampler_x2,
-            upsampler_x4,
-            downsampler_x2,
-            downsampler_x4,
+            oversampler: Oversampler::new(oversample, 1, sample_rate),
             can_propagate_silence: true,
         }
     }
