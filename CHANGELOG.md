@@ -11,6 +11,7 @@
 - Fix: `setTargetAtTime` and `setValueCurveAtTime` starting after the current render quantum no longer extrapolate the param value before their start time
 - Improved performance: an a-rate `AudioParam` whose values are equal over a render quantum (a constant input or an automation at rest) is passed to its node as a single value
 - Improved `GainNode` performance with an a-rate gain
+- Improved performance: a `ConvolverNode` given a new buffer no longer renders a silent tail for the impulse length before its input is heard
 
 ## Version 1.7.0 (2026-08-06)
 

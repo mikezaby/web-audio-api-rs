@@ -274,9 +274,36 @@ impl ConvolverNode {
             "NotSupportedError - the convolution buffer must consist of 1, 2 or 4 channels"
         );
 
+        let msg = ConvolverInfosMessage::new(&buffer, self.normalize);
+        self.registration.post_message(msg);
+        self.buffer = Some(buffer);
+    }
+
+    /// Denotes if the response buffer will be scaled with an equal-power normalization
+    pub fn normalize(&self) -> bool {
+        self.normalize
+    }
+
+    /// Update the `normalize` setting. This will only have an effect when `set_buffer` is called.
+    pub fn set_normalize(&mut self, value: bool) {
+        self.normalize = value;
+    }
+}
+
+struct ConvolverInfosMessage {
+    convolvers: Option<Vec<FFTConvolver<f32>>>,
+    impulse_length: usize,
+    impulse_number_of_channels: usize,
+}
+
+impl ConvolverInfosMessage {
+    /// Prepare the convolvers for an impulse response, on the control thread
+    fn new(buffer: &AudioBuffer, normalize: bool) -> Self {
+        let number_of_channels = buffer.number_of_channels();
+
         // normalize before padding because the length of the buffer affects the scale
-        let scale = if self.normalize {
-            normalize_buffer(&buffer)
+        let scale = if normalize {
+            normalize_buffer(buffer)
         } else {
             1.
         };
@@ -306,31 +333,12 @@ impl ConvolverNode {
             convolvers.push(convolver);
         }
 
-        let msg = ConvolverInfosMessage {
+        Self {
             convolvers: Some(convolvers),
             impulse_length: buffer.length(),
             impulse_number_of_channels: number_of_channels,
-        };
-
-        self.registration.post_message(msg);
-        self.buffer = Some(buffer);
+        }
     }
-
-    /// Denotes if the response buffer will be scaled with an equal-power normalization
-    pub fn normalize(&self) -> bool {
-        self.normalize
-    }
-
-    /// Update the `normalize` setting. This will only have an effect when `set_buffer` is called.
-    pub fn set_normalize(&mut self, value: bool) {
-        self.normalize = value;
-    }
-}
-
-struct ConvolverInfosMessage {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
-    impulse_length: usize,
-    impulse_number_of_channels: usize,
 }
 
 struct ConvolverRenderer {
@@ -500,6 +508,8 @@ impl AudioProcessor for ConvolverRenderer {
             std::mem::swap(&mut self.convolvers, convolvers);
             self.impulse_length = *impulse_length;
             self.impulse_number_of_channels = *impulse_number_of_channels;
+            // fresh convolvers have nothing to ring out until the input is heard
+            self.tail_count = self.impulse_length;
 
             return;
         }
@@ -512,8 +522,9 @@ impl AudioProcessor for ConvolverRenderer {
 mod tests {
     use float_eq::assert_float_eq;
 
-    use crate::context::{BaseAudioContext, OfflineAudioContext};
+    use crate::context::{AudioNodeId, BaseAudioContext, OfflineAudioContext};
     use crate::node::{AudioBufferSourceNode, AudioBufferSourceOptions, AudioScheduledSourceNode};
+    use crate::render::{Alloc, NodeCollection};
 
     use super::*;
 
@@ -665,6 +676,60 @@ mod tests {
         let output = output.channel_data(0).as_slice();
         assert!(!output[..IR_LEN].iter().any(|v| *v <= 1E-6));
         assert_float_eq!(&output[IR_LEN..], &[0.; 512 - IR_LEN][..], abs_all <= 1E-6);
+    }
+
+    #[test]
+    fn test_fresh_impulse_has_no_tail() {
+        let alloc = Alloc::with_capacity(2);
+        let nodes = NodeCollection::new();
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        let ir = AudioBuffer::from(vec![vec![1.; 48000]], 48000.);
+        let mut renderer = ConvolverRenderer {
+            convolvers: None,
+            impulse_length: 0,
+            impulse_number_of_channels: 0,
+            tail_count: 0,
+        };
+        renderer.onmessage(&mut ConvolverInfosMessage::new(&ir, true));
+
+        let inputs = [AudioRenderQuantum::from(alloc.silence())];
+        let mut outputs = [AudioRenderQuantum::from(alloc.silence())];
+
+        // a convolver that never heard its input stays silent at once
+        let tail = renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope,
+        );
+        assert!(!tail);
+        assert!(outputs[0].is_silent());
+
+        // once fed, it rings for the length of the impulse
+        let mut inputs = [AudioRenderQuantum::from(alloc.silence())];
+        inputs[0].channel_data_mut(0)[0] = 1.;
+        assert!(renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope
+        ));
+
+        let inputs = [AudioRenderQuantum::from(alloc.silence())];
+        assert!(renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope
+        ));
+        assert!(!outputs[0].is_silent());
     }
 
     #[test]
