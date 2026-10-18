@@ -8,9 +8,13 @@ use crate::render::{
 };
 use crate::{AtomicF32, RENDER_QUANTUM_SIZE};
 
+use super::delay::{get_playback_infos, PlaybackInfo};
 use super::{AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation};
 
 // Converting a value 𝑣 in decibels to linear gain unit means returning 10𝑣/20.
+
+/// The spec's lookahead: the input reaches the reduction gain through a DelayNode of 6 ms
+const PRE_DELAY: f32 = 0.006;
 fn db_to_lin(val: f32) -> f32 {
     (10.0_f32).powf(val / 20.)
 }
@@ -248,10 +252,10 @@ impl DynamicsCompressorNode {
 
             let reduction = Arc::new(AtomicF32::new(0.));
 
-            // define the number of buffers we need to have a delay line of ~6ms
-            // const delay = new DelayNode(context, {delayTime: 0.006});
-            let ring_buffer_size =
-                (context.sample_rate() * 0.006 / RENDER_QUANTUM_SIZE as f32).ceil() as usize + 1;
+            // blocks the 6 ms pre-delay reads from, plus the block being written and one to spare
+            let ring_buffer_size = (context.sample_rate() * PRE_DELAY / RENDER_QUANTUM_SIZE as f32)
+                .ceil() as usize
+                + 2;
             let ring_buffer = Vec::<AudioRenderQuantum>::with_capacity(ring_buffer_size);
 
             let render = DynamicsCompressorRenderer {
@@ -452,27 +456,67 @@ impl AudioProcessor for DynamicsCompressorRenderer {
         // store input in delay line
         self.ring_buffer[self.ring_index] = input;
 
-        // apply compression to delayed signal
-        let read_index = (self.ring_index + 1) % ring_size;
-        let delayed = &self.ring_buffer[read_index];
-
-        self.ring_index = read_index;
-
-        output.clone_from(delayed);
+        // [spec] The input reaches the reduction gain through
+        // `new DelayNode(context, {delayTime: 0.006})`: read it the way a DelayNode with that
+        // constant delay time does. The block spans two stored blocks.
+        let sample_rate = f64::from(sample_rate);
+        let PlaybackInfo {
+            prev_block_index,
+            prev_frame_index,
+            k,
+        } = get_playback_infos(
+            f64::from(PRE_DELAY),
+            false,
+            0.,
+            RENDER_QUANTUM_SIZE as f64 / sample_rate,
+            sample_rate,
+            ring_size as i32,
+            self.ring_index as i32,
+        );
+        let delayed = [
+            &self.ring_buffer[prev_block_index],
+            &self.ring_buffer[(prev_block_index + 1) % ring_size],
+        ];
+        self.ring_index = (self.ring_index + 1) % ring_size;
 
         // if delayed signal is silent, there is no compression to apply
         // thus we can consider the node has reach is tail time. (TBC)
-        if output.is_silent() {
+        if delayed.iter().all(|block| block.is_silent()) {
             output.make_silent(); // truncate to 1 channel if needed
             return false;
         }
 
-        output.channels_mut().iter_mut().for_each(|channel| {
-            channel
+        let number_of_channels = delayed
+            .iter()
+            .map(|block| block.number_of_channels())
+            .max()
+            .unwrap();
+        output.set_number_of_channels(number_of_channels);
+
+        for (channel_number, output_channel) in output.channels_mut().iter_mut().enumerate() {
+            // at most 2 channels: a mono or silent block upmixes by copying its channel
+            let [earlier, later] = delayed.map(|block| {
+                &block.channel_data(channel_number.min(block.number_of_channels() - 1))[..]
+            });
+            let sample = |frame: usize| {
+                if frame < RENDER_QUANTUM_SIZE {
+                    earlier[frame]
+                } else {
+                    later[frame - RENDER_QUANTUM_SIZE]
+                }
+            };
+
+            output_channel
+                .make_mut_for_overwrite()
                 .iter_mut()
                 .zip(reduction_gains.iter())
-                .for_each(|(o, g)| *o *= g);
-        });
+                .enumerate()
+                .for_each(|(i, (o, g))| {
+                    let frame = prev_frame_index + i;
+                    let value = (1. - k).mul_add(sample(frame), k * sample(frame + 1));
+                    *o = value * g;
+                });
+        }
 
         true
     }
@@ -524,12 +568,10 @@ mod tests {
     #[test]
     fn test_inner_delay() {
         let sample_rate = 44_100.;
-        let compressor_delay = 0.006;
-        // index of the first non zero sample, rounded at next block after
-        // compressor theoretical delay, i.e. 3 blocks at this sample_rate
-        let non_zero_index = (compressor_delay * sample_rate / RENDER_QUANTUM_SIZE as f32).ceil()
-            as usize
-            * RENDER_QUANTUM_SIZE;
+        // the signal starts at frame 0, 6 ms are 264.6 frames: frame 264 is the first to
+        // interpolate towards it
+        let non_zero_index = (f64::from(PRE_DELAY) * sample_rate as f64).floor() as usize;
+        assert_eq!(non_zero_index, 264);
 
         let mut context = OfflineAudioContext::new(1, 128 * 8, sample_rate);
 
@@ -555,10 +597,47 @@ mod tests {
             abs_all <= 0.
         );
 
-        // as some compression is applied, we just check the remaining is non zero
-        for sample in chan.iter().take(128 * 8).skip(non_zero_index) {
+        // as some compression is applied, we just check the delayed signal is non zero: 640
+        // frames, the last one reached at 264.6 frames later, interpolated into frame 904
+        let end_index = 128 * 5 + non_zero_index;
+        for sample in &chan[non_zero_index..=end_index] {
             assert!(*sample != 0.);
         }
+        assert!(chan[end_index + 1..].iter().all(|v| *v == 0.));
+    }
+
+    #[test]
+    fn test_pre_delay_is_a_delay_node_of_6_ms() {
+        // with a ratio of 1 nothing is compressed and the makeup gain is 0 dB: the output is the
+        // input through the spec's `new DelayNode(context, {delayTime: 0.006})`
+        let sample_rate = 44_100.;
+        let length = 128 * 6;
+        let signal: Vec<f32> = (0..length)
+            .map(|i| ((i * 7919) % 101) as f32 / 101. - 0.5)
+            .collect();
+
+        let render = |through_compressor: bool| {
+            let mut context = OfflineAudioContext::new(1, length, sample_rate);
+            let mut buffer = context.create_buffer(1, length, sample_rate);
+            buffer.copy_to_channel(&signal, 0);
+            let mut src = context.create_buffer_source();
+            src.set_buffer(buffer);
+            if through_compressor {
+                let compressor = DynamicsCompressorNode::new(&context, Default::default());
+                compressor.ratio().set_value(1.);
+                src.connect(&compressor);
+                compressor.connect(&context.destination());
+            } else {
+                let delay = context.create_delay(1.);
+                delay.delay_time().set_value(PRE_DELAY);
+                src.connect(&delay);
+                delay.connect(&context.destination());
+            }
+            src.start();
+            context.start_rendering_sync().get_channel_data(0).to_vec()
+        };
+
+        assert_float_eq!(render(true)[..], render(false)[..], abs_all <= 0.);
     }
 
     #[test]
