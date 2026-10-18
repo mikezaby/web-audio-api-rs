@@ -275,7 +275,7 @@ impl AudioProcessor for AnalyserRenderer {
         let output = &mut outputs[0];
 
         // pass through input
-        *output = input.clone();
+        output.clone_from(input);
 
         // down mix to mono
         let mut mono = input.clone();

@@ -397,7 +397,7 @@ impl AudioProcessor for WaveShaperRenderer {
             return false;
         }
 
-        *output = input.clone();
+        output.clone_from(input);
 
         if let Some(curve) = &self.curve {
             match self.oversample {
