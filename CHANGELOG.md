@@ -9,6 +9,7 @@
 - Non-standard `BaseAudioContext::set_render_group` tags nodes with a render group, the unit of parallel rendering
 - Non-standard `AudioContextOptions::render_threads` and `OfflineAudioContext::set_render_threads` render groups on several threads in the same render quantum. Real-time helpers get real-time priority and, on macOS, join the output device's audio workgroup. The render thread sleeps while it waits for the other threads
 - Non-standard `worklet::AudioParamValues::get_by_index` returns a param's values by its position in `parameter_descriptors`, as a slice that lives for the whole `process` call
+- Fix: `DynamicsCompressorNode` delays its input by 6 ms, read like a `DelayNode` with a `delayTime` of 0.006 as in the spec's processing model, instead of by whole render quanta (8.7 ms at 44.1 kHz)
 - Fix: `setTargetAtTime` and `setValueCurveAtTime` starting after the current render quantum no longer extrapolate the param value before their start time
 - Improved performance: an a-rate `AudioParam` whose values are equal over a render quantum (a constant input or an automation at rest) is passed to its node as a single value
 - Improved performance: an `AudioParam` with no automation pending and no input skips its rendering until a value or an input arrives
