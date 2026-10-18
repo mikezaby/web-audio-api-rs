@@ -15,6 +15,7 @@
 - Improved `ConvolverNode` performance: a non-uniform partitioned convolution spreads the work of its long partitions over the render quanta of a block, so the cost per quantum is lower and even (a 3 s stereo impulse response went from 44 to 10 us per quantum on an M1, the worst quantum from 353 to 141 us). The `fft-convolver` dependency is gone
 - Improved performance of a-rate `exponentialRampToValueAtTime` and `setTargetAtTime`: samples follow from the first one by a constant factor instead of a `powf` or `exp` each. Exponential ramps are computed in f64 and now land within one ULP of the spec formula, where they could be a few ULP off
 - Improved `BiquadFilterNode` performance with a-rate params: params the filter type does not use no longer force per-sample coefficients, frames whose params repeat reuse the coefficients before them, and a constant Q is converted once per quantum
+- Improved performance when nodes end: the render thread removes the nodes that ended in a quantum together, and with render groups patches the group plan instead of rebuilding it
 
 ## Version 1.7.0 (2026-08-06)
 

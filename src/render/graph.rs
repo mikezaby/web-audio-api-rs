@@ -155,6 +155,8 @@ pub(crate) struct Graph {
     plan: Box<GroupPlan>,
     /// Helper threads rendering groups alongside the render thread, boxed to keep `Graph` small
     workers: Option<Box<Workers>>,
+    /// Nodes that ended this quantum, removed once every node rendered
+    dropped: Vec<AudioNodeId>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -179,6 +181,7 @@ impl Graph {
             cycle_breakers: vec![],
             plan: Box::default(),
             workers: None,
+            dropped: Vec::with_capacity(64),
         }
     }
 
@@ -544,45 +547,30 @@ impl Graph {
             self.order_nodes();
         }
 
-        // keep track of end-of-lifecyle nodes
-        let mut nodes_dropped = false;
-
         if self.plan.groups.is_empty() {
             // process every node, in topological sorted order
             for &index in &self.ordered {
                 if Self::render_node::<false>(&self.nodes, &[], index, scope) {
-                    Self::remove_node(&mut self.nodes, &mut self.reclaim_id_channel, index, scope);
-                    nodes_dropped = true;
+                    self.dropped.push(index);
                 }
             }
-        } else if self.render_groups(scope) {
-            // ponytail: rebuild the whole plan when a node drops, patch it in place if that shows
-            // up in profiles
-            self.ordered.clear();
+        } else {
+            self.render_groups(scope);
         }
 
-        // If there were any nodes decommissioned, remove from graph order
-        if nodes_dropped {
-            let mut i = 0;
-            while i < self.ordered.len() {
-                if !self.nodes.contains(self.ordered[i]) {
-                    self.ordered.remove(i);
-                } else {
-                    i += 1;
-                }
-            }
+        if !self.dropped.is_empty() {
+            self.remove_dropped(scope);
         }
 
         // Return the output buffer of destination node
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
     }
 
-    /// Render every group in dependency order, then remove the nodes that ended
+    /// Render every group in dependency order, then collect the nodes that ended
     ///
-    /// Kept out of `render` so the path without groups stays as compact as it was. Returns true
-    /// when nodes were removed.
+    /// Kept out of `render` so the path without groups stays as compact as it was.
     #[inline(never)]
-    fn render_groups(&mut self, scope: &AudioWorkletGlobalScope) -> bool {
+    fn render_groups(&mut self, scope: &AudioWorkletGlobalScope) {
         match &self.workers {
             Some(workers) if (2..=MAX_GROUPS).contains(&self.plan.groups.len()) => {
                 workers.render(&self.nodes, &self.plan, scope);
@@ -596,14 +584,9 @@ impl Graph {
         }
 
         // Ended nodes leave only now, so the node collection stays the same while groups render
-        let mut nodes_dropped = false;
         for group in &mut self.plan.groups {
-            for index in group.dropped.get_mut().drain(..) {
-                Self::remove_node(&mut self.nodes, &mut self.reclaim_id_channel, index, scope);
-                nodes_dropped = true;
-            }
+            self.dropped.append(group.dropped.get_mut());
         }
-        nodes_dropped
     }
 
     /// Deliver the mailboxes of one group, render its nodes and note the ones that ended
@@ -713,31 +696,42 @@ impl Graph {
         can_free
     }
 
-    /// Decommission a node at the end of its life
-    #[inline(always)]
-    fn remove_node(
-        nodes: &mut NodeCollection,
-        reclaim_id_channel: &mut llq::Producer<AudioNodeId>,
-        index: AudioNodeId,
-        scope: &AudioWorkletGlobalScope,
-    ) {
-        // Node is dropped, remove it from the node list
-        let mut node = nodes.remove(index).into_inner();
-        reclaim_id_channel.push(node.reclaim_id.take().unwrap());
-        scope.node_id.set(index);
-        node.processor.before_drop(scope);
-        drop(node);
+    /// Decommission the nodes that ended this quantum
+    ///
+    /// Removing nodes and their edges cannot change the order of the others, nor add a dependency
+    /// between groups, so the order and the group plan are patched instead of rebuilt. A mailbox
+    /// to or from a removed node is no longer written, and delivers nothing.
+    fn remove_dropped(&mut self, scope: &AudioWorkletGlobalScope) {
+        let dropped = &self.dropped;
+
+        for &index in dropped {
+            // Node is dropped, remove it from the node list
+            let mut node = self.nodes.remove(index).into_inner();
+            self.reclaim_id_channel
+                .push(node.reclaim_id.take().unwrap());
+            scope.node_id.set(index);
+            node.processor.before_drop(scope);
+            drop(node);
+        }
 
         // Nodes are only dropped when they do not have incoming connections.
         // But they may have AudioParams feeding into them, these can de dropped too.
-        nodes.values_mut().for_each(|node| {
-            // Check if this node was connected to the dropped node. In that case, it is
+        self.nodes.values_mut().for_each(|node| {
+            // Check if this node was connected to a dropped node. In that case, it is
             // either an AudioParam or the AudioListener that feeds into a PannerNode.
             // These should be disconnected
             node.get_mut()
                 .outgoing_edges
-                .retain(|e| e.other_id != index);
+                .retain(|e| !dropped.contains(&e.other_id));
         });
+
+        let nodes = &self.nodes;
+        self.ordered.retain(|&index| nodes.contains(index));
+        for group in &mut self.plan.groups {
+            group.ordered.retain(|&index| nodes.contains(index));
+        }
+
+        self.dropped.clear();
     }
 
     pub fn before_drop(&mut self, scope: &AudioWorkletGlobalScope) {
@@ -1328,6 +1322,47 @@ mod tests {
             node_id: std::cell::Cell::new(AudioNodeId(0)),
             event_sender: crossbeam_channel::unbounded().0,
         }
+    }
+
+    #[test]
+    fn a_dropped_node_leaves_the_group_plan_in_place() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let nodes: [(u64, u32, Box<dyn AudioProcessor>); 4] = [
+            (0, 0, Box::new(PassNode)),
+            (1, 1, Box::new(PassNode)),
+            (2, 1, Box::new(TestNode { tail_time: false })),
+            (3, 2, Box::new(OneNode)),
+        ];
+        for (id, group, node) in nodes {
+            let id = AudioNodeId(id);
+            graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+        }
+        add_edge(&mut graph, 2, 1);
+        add_edge(&mut graph, 1, 0);
+        add_edge(&mut graph, 3, 0);
+        // node 2 may drop once it rendered
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(2))
+            .control_handle_dropped = true;
+
+        let scope = test_scope();
+        graph.render(&scope);
+
+        assert!(!graph.nodes.contains(AudioNodeId(2)));
+        // the order and the plan are patched, not cleared for a rebuild
+        assert_eq!(graph.ordered.len(), 3);
+        assert!(!graph.ordered.contains(&AudioNodeId(2)));
+        assert_eq!(graph.plan.groups.len(), 3);
+        assert!(graph
+            .plan
+            .groups
+            .iter()
+            .all(|group| !group.ordered.contains(&AudioNodeId(2))));
+
+        // and the rest keeps rendering: group 2's signal still reaches the destination
+        let output = graph.render(&scope);
+        assert_eq!(output.channel_data(0)[0], 1.);
     }
 
     #[test]

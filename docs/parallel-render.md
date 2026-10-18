@@ -140,7 +140,7 @@ The plan depends on these facts, checked on `main` at `03d0cb2`.
   The consumer, before its group renders, adds each incoming mailbox into the target input through its own pool, in a fixed order (producer node id, then output index).
   The fixed order keeps sums deterministic for any thread count.
   An `AudioParam` input from another group is a mailbox like any other.
-- Node removal is recorded in the group's drop list and applied on the callback thread after all groups finish, using the existing removal code, then the order is invalidated.
+- Node removal is recorded in the group's drop list and applied on the callback thread after all groups finish. The order and each group's node list are then patched in place: removing nodes cannot reorder the others or add a dependency between groups, and a mailbox to or from a removed node is no longer written.
 - With no groups other than group 0, the current single loop runs unchanged.
 
 ### Worker pool, Ardour style
@@ -179,7 +179,7 @@ Measure before committing any step that claims a speedup.
 2. The group plan in `order_nodes`: merge rules, per-group order, counts, roots.
    Unit tests in `src/render/graph/test.rs`: two-way dependency merge, three-group cycle merge, panner merge, filtered order stays topological.
 3. Mailboxes for edges between groups, and rendering groups one after another in dependency order.
-   Registering or dropping a node while groups are in use rebuilds the whole plan.
+   Registering a node while groups are in use rebuilds the whole plan. Dropping one first did too; it now patches the plan in place.
 4. Buffer pools per render group, and copies on edges between render groups within a merged group.
    Built differently from the first draft of this plan (per-group node collections), see "Rendering with groups".
 5. Deferred node removal.
