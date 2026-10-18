@@ -13,6 +13,7 @@
 - The control message channel of an `AudioContext` holds 4096 messages instead of 256, so building a large graph no longer blocks the control thread for a render callback per 256 messages; the render thread applies at most 256 between two render quanta
 - Improved `PeriodicWave` creation: the table is one inverse FFT instead of a sine and a cosine per sample and harmonic (17 ms to 0.15 ms for 513 coefficients on an M1), and the high harmonics are more accurate
 - Improved `GainNode` performance: an a-rate gain vectorises, and the product is written into the output instead of copying the input there first
+- Improved performance: an `AudioParam` with no automation pending and no input skips its rendering until a value or an input arrives
 
 ## Version 1.8.0 (2026-11-12)
 
