@@ -40,7 +40,7 @@ Everything is split between the **control thread** (user-facing objects: context
 ### Render thread is real-time: no allocations, locks, or blocking deallocations
 
 - Payloads are allocated on the control thread (wrapped in `llq::Node` before sending). `AudioProcessor::onmessage(&mut dyn Any)` should take ownership via `downcast_mut` + `std::mem::replace`/swap rather than letting a heap value drop in the render thread (see the tombstone trick in `AudioParamProcessor::onmessage`, `src/param.rs`).
-- Dropped processors and buffers are shipped to a garbage-collector sidecar thread (`spawn_garbage_collector_thread` in `src/render/thread.rs`).
+- Message payloads are shipped to a garbage-collector sidecar thread (`spawn_garbage_collector_thread` in `src/render/thread.rs`). The processors of removed nodes are dropped on the render thread: one can hold buffers of the render thread's pools (`Rc`), and releasing those on another thread races with rendering. A removed node's input and output lists are emptied and kept for new nodes.
 - `alloc_counter::deny_alloc` is used in tests to assert allocation-free paths (`src/render/quantum.rs`).
 - A panicking `AudioProcessor` is caught, the node is removed from the graph, and an `ErrorEvent` is sent (`tests/processor_error.rs`).
 
