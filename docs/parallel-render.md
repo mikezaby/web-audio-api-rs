@@ -162,7 +162,7 @@ The plan depends on these facts, checked on `main` at `03d0cb2`.
   A group is triggered only after all its producers finish, ordered by `AcqRel` on the counters.
   No `Rc` leaves its render group (pools per render group, copies on every edge between render groups, a `DelayNode`'s pair in one render group).
   The node collection does not change while groups render (removal waits for the end of the quantum, registration happens between quanta).
-- The merged group holding the destination renders on the callback thread, because the render thread keeps a clone of the destination output between callbacks (`buffer_offset` in `src/render/thread.rs`).
+- The merged group holding the destination renders on whichever thread takes it. The render thread keeps a clone of the destination output between callbacks (`buffer_offset` in `src/render/thread.rs`), which is safe because it touches that clone only between graph renders, while no group renders. Pinning that group to the callback thread was tried and measured slower (the 8x8 mix on 2 threads offline, M1 Pro: 74 to 77 us per quantum): the master chain then waits for the callback thread to come free.
 - Panics: keep the per-node `catch_unwind`.
   A worker must still decrement its counters after a panic (use a drop guard) so the quantum completes.
 - Control messages and order rebuilds stay on the callback thread between quanta, as today.
