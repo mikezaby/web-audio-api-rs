@@ -74,17 +74,18 @@ fn compute_linear_ramp_sample(
     diff.mul_add(phase as f32, start_value)
 }
 
-// v(t) = v1 * (v2/v1)^((t-t1) / (t2-t1))
+// v(t) = v1 * (v2/v1)^((t-t1) / (t2-t1)), in f64 so the a-rate path can step
+// from it by a constant factor per sample
 #[inline(always)]
 fn compute_exponential_ramp_sample(
     start_time: f64,
     duration: f64,
     start_value: f32,
-    ratio: f32, // end_value / start_value
+    ratio: f64, // end_value / start_value
     time: f64,
 ) -> f32 {
     let phase = (time - start_time) / duration;
-    start_value * ratio.powf(phase as f32)
+    (f64::from(start_value) * ratio.powf(phase)) as f32
 }
 
 // 𝑣(𝑡) = 𝑉1 + (𝑉0 − 𝑉1) * 𝑒^−((𝑡−𝑇0) / 𝜏)
@@ -1199,7 +1200,7 @@ impl AudioParamProcessor {
 
         let start_value = last_event.value;
         let end_value = event.value;
-        let ratio = end_value / start_value;
+        let ratio = f64::from(end_value) / f64::from(start_value);
 
         // Handle edge cases:
         // > If 𝑉0 and 𝑉1 have opposite signs or if 𝑉0 is zero,
@@ -1231,23 +1232,17 @@ impl AudioParamProcessor {
             let end_index_clipped = end_index.min(infos.count);
 
             if end_index_clipped > start_index {
-                let mut time = (start_index as f64).mul_add(infos.dt, infos.block_time);
+                let time = (start_index as f64).mul_add(infos.dt, infos.block_time);
+                // the first sample by the formula, the next ones by a constant
+                // factor per sample instead of a `powf` each
+                let step = ratio.powf(infos.dt / duration);
+                let mut value = f64::from(start_value) * ratio.powf((time - start_time) / duration);
 
-                let mut value = 0.;
                 for _ in start_index..end_index_clipped {
-                    value = compute_exponential_ramp_sample(
-                        start_time,
-                        duration,
-                        start_value,
-                        ratio,
-                        time,
-                    );
-
-                    self.buffer.push(value);
-
-                    time += infos.dt;
+                    self.buffer.push(value as f32);
+                    value *= step;
                 }
-                self.intrinsic_value = value;
+                self.intrinsic_value = *self.buffer.last().unwrap();
             }
         }
 
@@ -1358,6 +1353,10 @@ impl AudioParamProcessor {
 
             if end_index_clipped > start_index {
                 let mut time = (start_index as f64).mul_add(infos.dt, infos.block_time);
+                // e^-((t-T0)/τ) by the formula at the first sample after T0,
+                // then by a constant factor per sample instead of an `exp` each
+                let step = (-infos.dt / time_constant).exp();
+                let mut decay: Option<f64> = None;
 
                 let mut value = 0.;
                 for _ in start_index..end_index_clipped {
@@ -1365,7 +1364,12 @@ impl AudioParamProcessor {
                     value = if time - start_time < 0. {
                         self.intrinsic_value
                     } else {
-                        compute_set_target_sample(start_time, time_constant, end_value, diff, time)
+                        let next = match decay {
+                            Some(decay) => decay * step,
+                            None => (-((time - start_time) / time_constant)).exp(),
+                        };
+                        decay = Some(next);
+                        diff.mul_add(next as f32, end_value)
                     };
 
                     self.buffer.push(value);
@@ -1678,6 +1682,11 @@ pub(crate) fn audio_param_pair(
 #[cfg(test)]
 mod tests {
     use float_eq::assert_float_eq;
+
+    // v(t) = v1 * (v2/v1)^((t-t1) / (t2-t1)), rounded once
+    fn exponential_ramp(start: f32, end: f32, phase: f64) -> f32 {
+        (f64::from(start) * (f64::from(end) / f64::from(start)).powf(phase)) as f32
+    }
 
     use crate::context::{BaseAudioContext, OfflineAudioContext};
     use crate::render::Alloc;
@@ -2174,12 +2183,12 @@ mod tests {
         let end: f32 = 1.;
 
         for t in 0..10 {
-            let value = start * (end / start).powf(t as f32 / 10.);
+            let value = exponential_ramp(start, end, t as f64 / 10.);
             res.push(value);
         }
 
         let vs = render.compute_intrinsic_values(0., 1., 10);
-        assert_float_eq!(vs, &res[..], abs_all <= 0.);
+        assert_float_eq!(vs, &res[..], ulps_all <= 1);
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
         assert_float_eq!(vs, &[1.0; 10][..], abs_all <= 0.);
@@ -2209,19 +2218,19 @@ mod tests {
         // set_value is implicit here as this is the first value of the computed ramp
         // exponential ramp (v(t) = v1*(v2/v1)^((t-t1)/(t2-t1)))
         for t in 0..10 {
-            let value = start * (end / start).powf(t as f32 / 10.);
+            let value = exponential_ramp(start, end, t as f64 / 10.);
             res.push(value);
         }
         // fill remaining with target value
         res.append(&mut vec![1.; 7]);
 
         let vs = render.compute_intrinsic_values(0., 1., 10);
-        assert_float_eq!(vs, &res[0..10], abs_all <= 0.);
-        assert_float_eq!(param.value(), res[0], abs <= 0.);
+        assert_float_eq!(vs, &res[0..10], ulps_all <= 1);
+        assert_float_eq!(param.value(), res[0], ulps <= 1);
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &res[10..20], abs_all <= 0.);
-        assert_float_eq!(param.value(), res[10], abs <= 0.);
+        assert_float_eq!(vs, &res[10..20], ulps_all <= 1);
+        assert_float_eq!(param.value(), res[10], ulps <= 1);
     }
 
     #[test]
@@ -2317,7 +2326,7 @@ mod tests {
         // set_value is implicit here as this is the first value of the computed ramp
         // exponential ramp (v(t) = v1*(v2/v1)^((t-t1)/(t2-t1)))
         for t in 0..10 {
-            let value = start * (end / start).powf(t as f32 / 10.);
+            let value = exponential_ramp(start, end, t as f64 / 10.);
             res.push(value);
         }
         // fill remaining with target value
@@ -2325,10 +2334,10 @@ mod tests {
 
         // recreate k-rate blocks from computed values
         let vs = render.compute_intrinsic_values(0., 1., 10);
-        assert_float_eq!(vs, &[res[0]; 1][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[res[0]; 1][..], ulps_all <= 1);
 
         let vs = render.compute_intrinsic_values(10., 1., 10);
-        assert_float_eq!(vs, &[res[10]; 1][..], abs_all <= 0.);
+        assert_float_eq!(vs, &[res[10]; 1][..], ulps_all <= 1);
 
         let vs = render.compute_intrinsic_values(20., 1., 10);
         assert_float_eq!(vs, &[1.; 1][..], abs_all <= 0.);
@@ -2415,7 +2424,7 @@ mod tests {
         let end: f32 = 0.0001;
         let mut res = [0.; 20];
         for (t, v) in res.iter_mut().enumerate() {
-            *v = start * (end / start).powf(t as f32 / 20.);
+            *v = exponential_ramp(start, end, t as f64 / 20.);
         }
 
         assert_float_eq!(vs, &res[10..], abs_all <= 1e-7);
@@ -3102,7 +3111,7 @@ mod tests {
             let end: f32 = 1.;
 
             for t in 0..6 {
-                let value = start * (end / start).powf(t as f32 / 10.);
+                let value = exponential_ramp(start, end, t as f64 / 10.);
                 res.push(value);
             }
 
@@ -3110,7 +3119,7 @@ mod tests {
             res.resize(10, hold_value);
 
             let vs = render.compute_intrinsic_values(0., 1., 10);
-            assert_float_eq!(vs, &res[..], abs_all <= 0.);
+            assert_float_eq!(vs, &res[..], ulps_all <= 1);
         }
 
         {
@@ -3136,15 +3145,15 @@ mod tests {
             let end: f32 = 1.;
 
             for t in 0..5 {
-                let value = start * (end / start).powf(t as f32 / 10.);
+                let value = exponential_ramp(start, end, t as f64 / 10.);
                 res.push(value);
             }
 
-            let hold_value = start * (end / start).powf(4.5 / 10.);
+            let hold_value = exponential_ramp(start, end, 0.45);
             res.resize(10, hold_value);
 
             let vs = render.compute_intrinsic_values(0., 1., 10);
-            assert_float_eq!(vs, &res[..], abs_all <= 0.);
+            assert_float_eq!(vs, &res[..], ulps_all <= 1);
         }
     }
 
