@@ -33,10 +33,10 @@ impl Default for DelayOptions {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-struct PlaybackInfo {
-    prev_block_index: usize,
-    prev_frame_index: usize,
-    k: f32,
+pub(super) struct PlaybackInfo {
+    pub prev_block_index: usize,
+    pub prev_frame_index: usize,
+    pub k: f32,
 }
 
 /// Node that delays the incoming audio signal by a certain amount
@@ -551,7 +551,7 @@ impl AudioProcessor for DelayReader {
         let mut playback_infos = [PlaybackInfo::default(); RENDER_QUANTUM_SIZE];
 
         if delay.len() == 1 {
-            playback_infos[0] = Self::get_playback_infos(
+            playback_infos[0] = get_playback_infos(
                 f64::from(delay[0]),
                 self.in_cycle,
                 0.,
@@ -588,7 +588,7 @@ impl AudioProcessor for DelayReader {
                 .zip(playback_infos.iter_mut())
                 .enumerate()
                 .for_each(|(index, (&d, infos))| {
-                    *infos = Self::get_playback_infos(
+                    *infos = get_playback_infos(
                         f64::from(d),
                         self.in_cycle,
                         index as f64,
@@ -683,63 +683,63 @@ impl AudioProcessor for DelayReader {
     }
 }
 
-impl DelayReader {
-    #[inline(always)]
-    fn get_playback_infos(
-        delay: f64,
-        in_cycle: bool,
-        sample_index: f64,
-        quantum_duration: f64,
-        sample_rate: f64,
-        ring_size: i32,
-        ring_index: i32,
-    ) -> PlaybackInfo {
-        // param is already clamped to max_delay_time internally, so it is
-        // safe to only check lower boundary
-        let clamped_delay = if in_cycle {
-            delay.max(quantum_duration)
-        } else {
-            delay
-        };
-        let num_samples = clamped_delay * sample_rate;
-        // negative position of the playhead relative to this block start
-        let position = sample_index - num_samples;
-        let position_floored = position.floor();
-        // find address of the frame in the ring buffer just before `position`
-        let num_frames = RENDER_QUANTUM_SIZE as i32;
+/// Where the playhead of a delay of `delay` seconds reads, for `sample_index` of the block
+/// whose input sits at `ring_index` of a ring of `ring_size` blocks
+#[inline(always)]
+pub(super) fn get_playback_infos(
+    delay: f64,
+    in_cycle: bool,
+    sample_index: f64,
+    quantum_duration: f64,
+    sample_rate: f64,
+    ring_size: i32,
+    ring_index: i32,
+) -> PlaybackInfo {
+    // param is already clamped to max_delay_time internally, so it is
+    // safe to only check lower boundary
+    let clamped_delay = if in_cycle {
+        delay.max(quantum_duration)
+    } else {
+        delay
+    };
+    let num_samples = clamped_delay * sample_rate;
+    // negative position of the playhead relative to this block start
+    let position = sample_index - num_samples;
+    let position_floored = position.floor();
+    // find address of the frame in the ring buffer just before `position`
+    let num_frames = RENDER_QUANTUM_SIZE as i32;
 
-        // offset of the block in which the target sample is recorded
-        // we need to be `float` here so that `floor()` behaves as expected
-        let block_offset = (position_floored / num_frames as f64).floor();
-        // index of the block in which the target sample is recorded
-        let mut prev_block_index = ring_index + block_offset as i32;
-        // unroll ring buffer is needed
-        if prev_block_index < 0 {
-            prev_block_index += ring_size;
-        }
+    // offset of the block in which the target sample is recorded
+    // we need to be `float` here so that `floor()` behaves as expected
+    let block_offset = (position_floored / num_frames as f64).floor();
+    // index of the block in which the target sample is recorded
+    let mut prev_block_index = ring_index + block_offset as i32;
+    // unroll ring buffer is needed
+    if prev_block_index < 0 {
+        prev_block_index += ring_size;
+    }
 
-        // find frame index in the target block
-        let mut frame_offset = position_floored as i32 % num_frames;
-        // handle special 0 case
-        if frame_offset == 0 {
-            frame_offset = -num_frames;
-        }
+    // find frame index in the target block
+    let mut frame_offset = position_floored as i32 % num_frames;
+    // handle special 0 case
+    if frame_offset == 0 {
+        frame_offset = -num_frames;
+    }
 
-        let prev_frame_index = if frame_offset <= 0 {
-            num_frames + frame_offset
-        } else {
-            // sub-quantum delay
-            frame_offset
-        };
+    let prev_frame_index = if frame_offset <= 0 {
+        num_frames + frame_offset
+    } else {
+        // sub-quantum delay
+        frame_offset
+    };
 
-        // as position is negative k will be what we expect
-        let k = (position - position_floored) as f32;
+    // as position is negative k will be what we expect
+    let k = (position - position_floored) as f32;
 
-        PlaybackInfo {
-            prev_block_index: prev_block_index as usize,
-            prev_frame_index: prev_frame_index as usize,
-            k,
-        }
+    PlaybackInfo {
+        prev_block_index: prev_block_index as usize,
+        prev_frame_index: prev_frame_index as usize,
+        k,
     }
 }
 
