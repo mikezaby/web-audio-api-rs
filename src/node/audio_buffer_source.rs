@@ -641,189 +641,256 @@ impl AudioProcessor for AudioBufferSourceRenderer {
                 self.render_state.entered_loop = false;
             }
 
-            // internal buffer used to store playback infos to compute the samples
-            // according to the source buffer. (prev_sample_index, k)
-            let mut playback_infos = [None; RENDER_QUANTUM_SIZE];
+            let time_incr = dt * computed_playback_rate;
+            let block_end_time = buffer_time + time_incr * RENDER_QUANTUM_SIZE as f64;
+            // well beyond the tolerance of `almost` (1.5e-8, relative)
+            let margin = |value: f64| 1e-6 * value.abs().max(1.);
+            let (low, high) = if is_looping {
+                (actual_loop_start, actual_loop_end)
+            } else {
+                (0., buffer_duration)
+            };
 
-            // compute position for each sample and store into `self.positions`
-            for (i, playback_info) in playback_infos.iter_mut().enumerate() {
-                let current_time = block_time + i as f64 * dt;
+            // Steady state: playing forward for the whole block, already in the loop if any,
+            // and away from the start, the stop, the duration, the loop points and the last
+            // frame. None of the per-sample checks below can fire, so the same playheads are
+            // computed without them, with the same arithmetic in the same order.
+            let steady = self.render_state.started
+                && computed_playback_rate > 0.
+                && (!is_looping || self.render_state.entered_loop)
+                && next_block_time <= self.stop_time
+                && self.render_state.buffer_time_elapsed
+                    + (block_end_time - buffer_time)
+                    + margin(self.duration)
+                    < self.duration
+                && buffer_time > low + margin(low)
+                && block_end_time < high - margin(high)
+                && block_end_time * sampling_ratio * sample_rate + 2. < buffer_length as f64;
 
-                // Sticky behavior to handle floating point errors due to start time computation
-                // cf. test_subsample_buffer_stitching
-                if !self.render_state.started && almost::equal(current_time, self.start_time) {
-                    self.start_time = current_time;
-                }
-
-                if almost::equal(self.render_state.buffer_time_elapsed, self.duration) {
-                    self.render_state.buffer_time_elapsed = self.duration;
-                }
-
-                // Handle following cases:
-                // - we are before start time
-                // - we are after stop time
-                // - explicit duration (in buffer time reference) has been given and we have reached it
-                // Note that checking against buffer duration is done below to handle looping
-                if current_time < self.start_time
-                    || current_time >= self.stop_time
-                    || self.render_state.buffer_time_elapsed >= self.duration
-                {
-                    continue; // nothing more to do for this sample
-                }
-
-                // we have now reached start time
-                if !self.render_state.started {
-                    let delta = current_time - self.start_time;
-                    // handle that start time may be between last sample and this one
-                    self.offset += delta * computed_playback_rate;
-                    // clamp offset to buffer boundaries
-                    self.offset = self.offset.max(0.).min(buffer_duration);
-
-                    if is_looping && computed_playback_rate >= 0. && self.offset > actual_loop_end {
-                        self.offset = actual_loop_end;
-                    }
-
-                    if is_looping && computed_playback_rate < 0. && self.offset < actual_loop_start
-                    {
-                        self.offset = actual_loop_start;
-                    }
-
-                    buffer_time = self.offset;
-                    self.render_state.buffer_time_elapsed = (delta * computed_playback_rate).abs();
-                    self.render_state.started = true;
-                }
-
-                if is_looping {
-                    if almost::equal(buffer_time, actual_loop_end) {
-                        buffer_time = actual_loop_end;
-                    }
-
-                    if almost::equal(buffer_time, actual_loop_start) {
-                        buffer_time = actual_loop_start;
-                    }
-
-                    if !self.render_state.entered_loop {
-                        // playback began before or within loop, and playhead is now past loop start
-                        if self.offset < actual_loop_end && buffer_time >= actual_loop_start {
-                            self.render_state.entered_loop = true;
-                        }
-
-                        // playback began after loop, and playhead is now prior to the loop end
-                        if self.offset >= actual_loop_end && buffer_time < actual_loop_end {
-                            self.render_state.entered_loop = true;
-                        }
-                    }
-
-                    // check loop boundaries
-                    if self.render_state.entered_loop
-                        && (buffer_time >= actual_loop_end || buffer_time < actual_loop_start)
-                    {
-                        buffer_time = actual_loop_start
-                            + (buffer_time - actual_loop_start)
-                                .rem_euclid(actual_loop_end - actual_loop_start);
-                    }
-                }
-
-                if almost::zero(buffer_time) {
-                    buffer_time = 0.
-                }
-
-                if buffer_time >= 0. && buffer_time < buffer_duration {
+            if steady {
+                let mut frames = [0_usize; RENDER_QUANTUM_SIZE];
+                let mut weights = [0_f64; RENDER_QUANTUM_SIZE];
+                for (frame, weight) in frames.iter_mut().zip(weights.iter_mut()) {
                     let position = buffer_time * sampling_ratio;
                     let playhead = position * sample_rate;
                     let playhead_floored = playhead.floor();
-                    let prev_frame_index = playhead_floored as usize; // can't be < 0.
-                    let k = playhead - playhead_floored;
+                    *frame = playhead_floored as usize;
+                    *weight = playhead - playhead_floored;
 
-                    // Due to how buffer_time is computed, we can still run into
-                    // floating point errors and try to access a non existing index
-                    // cf. test_end_of_file_slow_track_2
-                    if prev_frame_index < buffer_length {
-                        *playback_info = Some(PlaybackInfo {
-                            prev_frame_index,
-                            k,
-                        });
-                    }
+                    buffer_time += time_incr;
+                    self.render_state.buffer_time_elapsed += time_incr.abs();
                 }
 
-                let time_incr = dt * computed_playback_rate;
-                buffer_time += time_incr;
-                self.render_state.buffer_time_elapsed += time_incr.abs();
-            }
+                buffer
+                    .channels()
+                    .iter()
+                    .zip(output.channels_mut().iter_mut())
+                    .for_each(|(buffer_channel, output_channel)| {
+                        let buffer_channel = buffer_channel.as_slice();
+                        output_channel
+                            .iter_mut()
+                            .zip(frames.iter().zip(weights.iter()))
+                            .for_each(|(o, (&frame, &k))| {
+                                let prev_sample = buffer_channel[frame] as f64;
+                                let next_sample = buffer_channel[frame + 1] as f64;
+                                *o = (1. - k).mul_add(prev_sample, k * next_sample) as f32;
+                            });
+                    });
+            } else {
+                // internal buffer used to store playback infos to compute the samples
+                // according to the source buffer. (prev_sample_index, k)
+                let mut playback_infos = [None; RENDER_QUANTUM_SIZE];
 
-            // fill output according to computed positions
-            buffer
-                .channels()
-                .iter()
-                .zip(output.channels_mut().iter_mut())
-                .for_each(|(buffer_channel, output_channel)| {
-                    let buffer_channel = buffer_channel.as_slice();
+                // compute position for each sample and store into `self.positions`
+                for (i, playback_info) in playback_infos.iter_mut().enumerate() {
+                    let current_time = block_time + i as f64 * dt;
 
-                    playback_infos
-                        .iter()
-                        .zip(output_channel.iter_mut())
-                        .for_each(|(playhead, o)| {
-                            *o = match playhead {
-                                Some(PlaybackInfo {
-                                    prev_frame_index,
-                                    k,
-                                }) => {
-                                    // `prev_frame_index` cannot be out of bounds
-                                    let prev_sample = buffer_channel[*prev_frame_index] as f64;
-                                    let next_sample = match buffer_channel.get(prev_frame_index + 1)
-                                    {
-                                        Some(val) => *val as f64,
-                                        // End of buffer
-                                        None => {
-                                            if is_looping {
-                                                if playback_rate >= 0. {
-                                                    let start_playhead =
-                                                        actual_loop_start * sample_rate;
-                                                    let start_index = if start_playhead.floor()
-                                                        == start_playhead
-                                                    {
-                                                        start_playhead as usize
+                    // Sticky behavior to handle floating point errors due to start time computation
+                    // cf. test_subsample_buffer_stitching
+                    if !self.render_state.started && almost::equal(current_time, self.start_time) {
+                        self.start_time = current_time;
+                    }
+
+                    if almost::equal(self.render_state.buffer_time_elapsed, self.duration) {
+                        self.render_state.buffer_time_elapsed = self.duration;
+                    }
+
+                    // Handle following cases:
+                    // - we are before start time
+                    // - we are after stop time
+                    // - explicit duration (in buffer time reference) has been given and we have reached it
+                    // Note that checking against buffer duration is done below to handle looping
+                    if current_time < self.start_time
+                        || current_time >= self.stop_time
+                        || self.render_state.buffer_time_elapsed >= self.duration
+                    {
+                        continue; // nothing more to do for this sample
+                    }
+
+                    // we have now reached start time
+                    if !self.render_state.started {
+                        let delta = current_time - self.start_time;
+                        // handle that start time may be between last sample and this one
+                        self.offset += delta * computed_playback_rate;
+                        // clamp offset to buffer boundaries
+                        self.offset = self.offset.max(0.).min(buffer_duration);
+
+                        if is_looping
+                            && computed_playback_rate >= 0.
+                            && self.offset > actual_loop_end
+                        {
+                            self.offset = actual_loop_end;
+                        }
+
+                        if is_looping
+                            && computed_playback_rate < 0.
+                            && self.offset < actual_loop_start
+                        {
+                            self.offset = actual_loop_start;
+                        }
+
+                        buffer_time = self.offset;
+                        self.render_state.buffer_time_elapsed =
+                            (delta * computed_playback_rate).abs();
+                        self.render_state.started = true;
+                    }
+
+                    if is_looping {
+                        if almost::equal(buffer_time, actual_loop_end) {
+                            buffer_time = actual_loop_end;
+                        }
+
+                        if almost::equal(buffer_time, actual_loop_start) {
+                            buffer_time = actual_loop_start;
+                        }
+
+                        if !self.render_state.entered_loop {
+                            // playback began before or within loop, and playhead is now past loop start
+                            if self.offset < actual_loop_end && buffer_time >= actual_loop_start {
+                                self.render_state.entered_loop = true;
+                            }
+
+                            // playback began after loop, and playhead is now prior to the loop end
+                            if self.offset >= actual_loop_end && buffer_time < actual_loop_end {
+                                self.render_state.entered_loop = true;
+                            }
+                        }
+
+                        // check loop boundaries
+                        if self.render_state.entered_loop
+                            && (buffer_time >= actual_loop_end || buffer_time < actual_loop_start)
+                        {
+                            buffer_time = actual_loop_start
+                                + (buffer_time - actual_loop_start)
+                                    .rem_euclid(actual_loop_end - actual_loop_start);
+                        }
+                    }
+
+                    if almost::zero(buffer_time) {
+                        buffer_time = 0.
+                    }
+
+                    if buffer_time >= 0. && buffer_time < buffer_duration {
+                        let position = buffer_time * sampling_ratio;
+                        let playhead = position * sample_rate;
+                        let playhead_floored = playhead.floor();
+                        let prev_frame_index = playhead_floored as usize; // can't be < 0.
+                        let k = playhead - playhead_floored;
+
+                        // Due to how buffer_time is computed, we can still run into
+                        // floating point errors and try to access a non existing index
+                        // cf. test_end_of_file_slow_track_2
+                        if prev_frame_index < buffer_length {
+                            *playback_info = Some(PlaybackInfo {
+                                prev_frame_index,
+                                k,
+                            });
+                        }
+                    }
+
+                    let time_incr = dt * computed_playback_rate;
+                    buffer_time += time_incr;
+                    self.render_state.buffer_time_elapsed += time_incr.abs();
+                }
+
+                // fill output according to computed positions
+                buffer
+                    .channels()
+                    .iter()
+                    .zip(output.channels_mut().iter_mut())
+                    .for_each(|(buffer_channel, output_channel)| {
+                        let buffer_channel = buffer_channel.as_slice();
+
+                        playback_infos
+                            .iter()
+                            .zip(output_channel.iter_mut())
+                            .for_each(|(playhead, o)| {
+                                *o = match playhead {
+                                    Some(PlaybackInfo {
+                                        prev_frame_index,
+                                        k,
+                                    }) => {
+                                        // `prev_frame_index` cannot be out of bounds
+                                        let prev_sample = buffer_channel[*prev_frame_index] as f64;
+                                        let next_sample = match buffer_channel
+                                            .get(prev_frame_index + 1)
+                                        {
+                                            Some(val) => *val as f64,
+                                            // End of buffer
+                                            None => {
+                                                if is_looping {
+                                                    if playback_rate >= 0. {
+                                                        let start_playhead =
+                                                            actual_loop_start * sample_rate;
+                                                        let start_index = if start_playhead.floor()
+                                                            == start_playhead
+                                                        {
+                                                            start_playhead as usize
+                                                        } else {
+                                                            start_playhead as usize + 1
+                                                        };
+
+                                                        buffer_channel
+                                                            [start_index.min(buffer_length - 1)]
+                                                            as f64
                                                     } else {
-                                                        start_playhead as usize + 1
-                                                    };
-
-                                                    buffer_channel
-                                                        [start_index.min(buffer_length - 1)]
-                                                        as f64
+                                                        let end_playhead =
+                                                            actual_loop_end * sample_rate;
+                                                        let end_index = end_playhead as usize;
+                                                        buffer_channel
+                                                            [end_index.min(buffer_length - 1)]
+                                                            as f64
+                                                    }
                                                 } else {
-                                                    let end_playhead =
-                                                        actual_loop_end * sample_rate;
-                                                    let end_index = end_playhead as usize;
-                                                    buffer_channel[end_index.min(buffer_length - 1)]
-                                                        as f64
-                                                }
-                                            } else {
-                                                // Handle 2 edge cases:
-                                                // 1. We are in a case where buffer time is below buffer
-                                                // duration due to floating point errors, but where
-                                                // prev_frame_index is last index and k is near 1. We can't
-                                                // filter this case before, because it might break
-                                                // loops logic.
-                                                // 2. Buffer contains only one sample
-                                                if almost::equal(*k, 1.) || *prev_frame_index == 0 {
-                                                    0.
-                                                } else {
-                                                    // Extrapolate next sample using the last two known samples
-                                                    // cf. https://github.com/WebAudio/web-audio-api/issues/2032
-                                                    let prev_prev_sample =
-                                                        buffer_channel[*prev_frame_index - 1];
-                                                    2. * prev_sample - prev_prev_sample as f64
+                                                    // Handle 2 edge cases:
+                                                    // 1. We are in a case where buffer time is below buffer
+                                                    // duration due to floating point errors, but where
+                                                    // prev_frame_index is last index and k is near 1. We can't
+                                                    // filter this case before, because it might break
+                                                    // loops logic.
+                                                    // 2. Buffer contains only one sample
+                                                    if almost::equal(*k, 1.)
+                                                        || *prev_frame_index == 0
+                                                    {
+                                                        0.
+                                                    } else {
+                                                        // Extrapolate next sample using the last two known samples
+                                                        // cf. https://github.com/WebAudio/web-audio-api/issues/2032
+                                                        let prev_prev_sample =
+                                                            buffer_channel[*prev_frame_index - 1];
+                                                        2. * prev_sample - prev_prev_sample as f64
+                                                    }
                                                 }
                                             }
-                                        }
-                                    };
+                                        };
 
-                                    (1. - k).mul_add(prev_sample, k * next_sample) as f32
-                                }
-                                None => 0.,
-                            };
-                        });
-                });
+                                        (1. - k).mul_add(prev_sample, k * next_sample) as f32
+                                    }
+                                    None => 0.,
+                                };
+                            });
+                    });
+            }
         }
 
         // Update render state
