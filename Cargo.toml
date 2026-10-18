@@ -23,7 +23,6 @@ arc-swap = "1.6"
 arrayvec = "0.7"
 # Without D-Bus (rtkit), Linux promotes with SCHED_FIFO directly, which needs RLIMIT_RTPRIO
 audio_thread_priority = { version = "0.38", default-features = false }
-fft-convolver = "0.3"
 cpal = { version = "0.18", optional = true }
 creek = { version = "1.2", default-features = false, features = [
     "decode",
