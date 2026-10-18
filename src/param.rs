@@ -666,6 +666,9 @@ pub(crate) struct AudioParamProcessor {
     event_timeline: AudioParamEventTimeline,
     last_event: Option<AudioParamEvent>,
     buffer: ArrayVec<f32, RENDER_QUANTUM_SIZE>,
+    /// The output holds the value of an empty timeline and a silent input, and no message came
+    /// since: until one does or the input is heard, every quantum renders the same
+    settled: bool,
 }
 
 impl AudioProcessor for AudioParamProcessor {
@@ -681,13 +684,24 @@ impl AudioProcessor for AudioParamProcessor {
         let input = &inputs[0]; // single input mode
         let output = &mut outputs[0];
 
+        if self.settled && input.is_silent() {
+            return true;
+        }
+
         self.compute_intrinsic_values(scope.current_time, period, RENDER_QUANTUM_SIZE);
         self.mix_to_output(input, output);
+        // an event at the block's end may have moved the value the next block starts from
+        self.settled = self.event_timeline.is_empty()
+            && input.is_silent()
+            && self.buffer.len() == 1
+            && self.buffer[0].to_bits() == self.intrinsic_value.to_bits();
 
         true // has intrinsic value
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        self.settled = false;
+
         if let Some(automation_rate) = msg.downcast_ref::<AutomationRate>() {
             self.automation_rate = *automation_rate;
             return;
@@ -1660,6 +1674,7 @@ pub(crate) fn audio_param_pair(
         event_timeline: AudioParamEventTimeline::new(),
         last_event: None,
         buffer: ArrayVec::new(),
+        settled: false,
     };
 
     (param, processor)
