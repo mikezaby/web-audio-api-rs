@@ -274,44 +274,7 @@ impl ConvolverNode {
             "NotSupportedError - the convolution buffer must consist of 1, 2 or 4 channels"
         );
 
-        // normalize before padding because the length of the buffer affects the scale
-        let scale = if self.normalize {
-            normalize_buffer(&buffer)
-        } else {
-            1.
-        };
-
-        let mut convolvers = Vec::<FFTConvolver<f32>>::new();
-        // @note - value defined by "rule of thumb", to be explored further
-        let partition_size = RENDER_QUANTUM_SIZE * 8;
-
-        // Handle multichannel IR
-        // cf. https://webaudio.github.io/web-audio-api/#Convolution-channel-configurations
-        // Note that in case of mono IR we create 2 convolvers to properly handle stereo input
-        for index in 0..number_of_channels.max(2) {
-            // make sure we don't try to access an inexisting channel, cf. note above
-            let channel = index.min(number_of_channels - 1);
-
-            let mut scaled_channel = vec![0.; buffer.length()];
-            scaled_channel
-                .iter_mut()
-                .zip(buffer.get_channel_data(channel))
-                .for_each(|(o, i)| *o = *i * scale);
-
-            let mut convolver = FFTConvolver::<f32>::default();
-            convolver
-                .init(partition_size, &scaled_channel)
-                .expect("Unable to initialize convolution engine");
-
-            convolvers.push(convolver);
-        }
-
-        let msg = ConvolverInfosMessage {
-            convolvers: Some(convolvers),
-            impulse_length: buffer.length(),
-            impulse_number_of_channels: number_of_channels,
-        };
-
+        let msg = ConvolverInfosMessage::new(&buffer, self.normalize);
         self.registration.post_message(msg);
         self.buffer = Some(buffer);
     }
@@ -342,6 +305,51 @@ struct ConvolverInfosMessage {
     convolvers: Option<Vec<FFTConvolver<f32>>>,
     impulse_length: usize,
     impulse_number_of_channels: usize,
+}
+
+impl ConvolverInfosMessage {
+    /// Prepare the convolvers for an impulse response, on the control thread
+    fn new(buffer: &AudioBuffer, normalize: bool) -> Self {
+        let number_of_channels = buffer.number_of_channels();
+
+        // normalize before padding because the length of the buffer affects the scale
+        let scale = if normalize {
+            normalize_buffer(buffer)
+        } else {
+            1.
+        };
+
+        let mut convolvers = Vec::<FFTConvolver<f32>>::new();
+        // @note - value defined by "rule of thumb", to be explored further
+        let partition_size = RENDER_QUANTUM_SIZE * 8;
+
+        // Handle multichannel IR
+        // cf. https://webaudio.github.io/web-audio-api/#Convolution-channel-configurations
+        // Note that in case of mono IR we create 2 convolvers to properly handle stereo input
+        for index in 0..number_of_channels.max(2) {
+            // make sure we don't try to access an inexisting channel, cf. note above
+            let channel = index.min(number_of_channels - 1);
+
+            let mut scaled_channel = vec![0.; buffer.length()];
+            scaled_channel
+                .iter_mut()
+                .zip(buffer.get_channel_data(channel))
+                .for_each(|(o, i)| *o = *i * scale);
+
+            let mut convolver = FFTConvolver::<f32>::default();
+            convolver
+                .init(partition_size, &scaled_channel)
+                .expect("Unable to initialize convolution engine");
+
+            convolvers.push(convolver);
+        }
+
+        Self {
+            convolvers: Some(convolvers),
+            impulse_length: buffer.length(),
+            impulse_number_of_channels: number_of_channels,
+        }
+    }
 }
 
 struct ConvolverRenderer {
@@ -511,6 +519,8 @@ impl AudioProcessor for ConvolverRenderer {
             std::mem::swap(&mut self.convolvers, convolvers);
             self.impulse_length = *impulse_length;
             self.impulse_number_of_channels = *impulse_number_of_channels;
+            // fresh convolvers have nothing to ring out until the input is heard
+            self.tail_count = self.impulse_length;
 
             return;
         }
@@ -524,8 +534,9 @@ mod tests {
     use float_eq::assert_float_eq;
     use std::sync::{Arc, Mutex};
 
-    use crate::context::{BaseAudioContext, OfflineAudioContext};
+    use crate::context::{AudioNodeId, BaseAudioContext, OfflineAudioContext};
     use crate::node::{AudioBufferSourceNode, AudioBufferSourceOptions, AudioScheduledSourceNode};
+    use crate::render::{Alloc, NodeCollection};
 
     use super::*;
 
@@ -720,6 +731,60 @@ mod tests {
         let output = output.channel_data(0).as_slice();
         assert!(!output[..IR_LEN].iter().any(|v| *v <= 1E-6));
         assert_float_eq!(&output[IR_LEN..], &[0.; 512 - IR_LEN][..], abs_all <= 1E-6);
+    }
+
+    #[test]
+    fn test_fresh_impulse_has_no_tail() {
+        let alloc = Alloc::with_capacity(2);
+        let nodes = NodeCollection::new();
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        let ir = AudioBuffer::from(vec![vec![1.; 48000]], 48000.);
+        let mut renderer = ConvolverRenderer {
+            convolvers: None,
+            impulse_length: 0,
+            impulse_number_of_channels: 0,
+            tail_count: 0,
+        };
+        renderer.onmessage(&mut ConvolverInfosMessage::new(&ir, true));
+
+        let inputs = [AudioRenderQuantum::from(alloc.silence())];
+        let mut outputs = [AudioRenderQuantum::from(alloc.silence())];
+
+        // a convolver that never heard its input stays silent at once
+        let tail = renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope,
+        );
+        assert!(!tail);
+        assert!(outputs[0].is_silent());
+
+        // once fed, it rings for the length of the impulse
+        let mut inputs = [AudioRenderQuantum::from(alloc.silence())];
+        inputs[0].channel_data_mut(0)[0] = 1.;
+        assert!(renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope
+        ));
+
+        let inputs = [AudioRenderQuantum::from(alloc.silence())];
+        assert!(renderer.process(
+            &inputs,
+            &mut outputs,
+            AudioParamValues::from(&nodes),
+            &scope
+        ));
+        assert!(!outputs[0].is_silent());
     }
 
     #[test]
