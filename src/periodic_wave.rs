@@ -1,7 +1,9 @@
 //! PeriodicWave interface
 
-use std::f32::consts::PI;
 use std::sync::Arc;
+
+use num_complex::Complex;
+use realfft::RealFftPlanner;
 
 use crate::context::BaseAudioContext;
 
@@ -94,9 +96,6 @@ impl PeriodicWave {
     /// * `PeriodicWave` is more than 8192 components
     //
     // @notes:
-    // - Current implementation is very naive and could be improved using inverse
-    // FFT or table lookup on SINETABLE. Such performance improvements should be
-    // however tested also against this implementation.
     // - Built-in types of the `OscillatorNode` should use periodic waves
     // c.f. https://webaudio.github.io/web-audio-api/#oscillator-coefficients
     // - The question of bandlimited oscillators should also be handled
@@ -161,25 +160,38 @@ impl PeriodicWave {
     }
 
     // cf. https://webaudio.github.io/web-audio-api/#waveform-generation
+    //
+    // The table is the sum over k of a[k] cos(2πki/N) + b[k] sin(2πki/N), which is the inverse
+    // real FFT of (a[k] - j b[k]) / 2: one transform instead of a sin and a cos per sample and
+    // harmonic. A harmonic above N/2 lands on bin N - k with its sine term negated.
     fn generate_wavetable(reals: &[f32], imags: &[f32], normalize: bool, size: usize) -> Vec<f32> {
-        let mut wavetable = Vec::with_capacity(size);
-        let pi_2 = 2. * PI;
+        let half = size / 2;
+        let mut spectrum = vec![Complex::<f64>::default(); half + 1];
 
-        for i in 0..size {
-            let mut sample = 0.;
-            let phase = pi_2 * i as f32 / size as f32;
-
-            for j in 1..reals.len() {
-                let freq = j as f32;
-                let real = reals[j];
-                let imag = imags[j];
-                let rad = phase * freq;
-                let contrib = real * rad.cos() + imag * rad.sin();
-                sample += contrib;
+        for (k, (&real, &imag)) in reals.iter().zip(imags).enumerate().skip(1) {
+            let (real, imag) = (f64::from(real), f64::from(imag));
+            match k % size {
+                // cos(2πki/N) is 1 and sin(2πki/N) is 0
+                0 => spectrum[0].re += real,
+                bin if bin < half => {
+                    spectrum[bin].re += real / 2.;
+                    spectrum[bin].im -= imag / 2.;
+                }
+                // cos(πi) alternates and sin(πi) is 0
+                bin if bin == half => spectrum[half].re += real,
+                bin => {
+                    spectrum[size - bin].re += real / 2.;
+                    spectrum[size - bin].im += imag / 2.;
+                }
             }
-
-            wavetable.push(sample);
         }
+
+        let inverse = RealFftPlanner::<f64>::new().plan_fft_inverse(size);
+        let mut table = inverse.make_output_vec();
+        inverse
+            .process(&mut spectrum, &mut table)
+            .expect("the spectrum of a real table");
+        let mut wavetable: Vec<f32> = table.iter().map(|&v| v as f32).collect();
 
         if normalize {
             Self::normalize(&mut wavetable);
@@ -353,5 +365,29 @@ mod tests {
         PeriodicWave::normalize(&mut expected);
 
         assert_float_eq!(result[..], expected[..], abs_all <= 1e-6);
+    }
+
+    #[test]
+    fn wavetable_matches_the_sum_with_harmonics_above_half_the_table() {
+        // every harmonic up to the 8191st, with a cosine and a sine term each
+        let reals: Vec<f32> = (0..8192)
+            .map(|k| ((k * 7) % 13) as f32 / 13. - 0.5)
+            .collect();
+        let imags: Vec<f32> = (0..8192)
+            .map(|k| ((k * 5) % 11) as f32 / 11. - 0.5)
+            .collect();
+
+        let result =
+            PeriodicWave::generate_wavetable(&reals, &imags, false, PERIODIC_WAVE_TABLE_LENGTH);
+
+        let size = PERIODIC_WAVE_TABLE_LENGTH;
+        for i in (0..size).step_by(size / 64) {
+            let mut expected = 0f64;
+            for k in 1..reals.len() {
+                let angle = 2. * std::f64::consts::PI * ((i * k) % size) as f64 / size as f64;
+                expected += f64::from(reals[k]) * angle.cos() + f64::from(imags[k]) * angle.sin();
+            }
+            assert_float_eq!(result[i], expected as f32, abs <= 1e-3, "sample {i}");
+        }
     }
 }
