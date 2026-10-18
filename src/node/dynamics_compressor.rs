@@ -458,7 +458,7 @@ impl AudioProcessor for DynamicsCompressorRenderer {
 
         self.ring_index = read_index;
 
-        *output = delayed.clone();
+        output.clone_from(delayed);
 
         // if delayed signal is silent, there is no compression to apply
         // thus we can consider the node has reach is tail time. (TBC)

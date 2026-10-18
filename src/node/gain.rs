@@ -174,7 +174,7 @@ impl AudioProcessor for GainRenderer {
 
             let diff_to_one = (1. - gain[0]).abs();
             if diff_to_one <= threshold {
-                *output = input.clone();
+                output.clone_from(input);
                 return false;
             }
         }
