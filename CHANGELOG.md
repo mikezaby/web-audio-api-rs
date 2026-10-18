@@ -14,6 +14,7 @@
 - Improved `BiquadFilterNode` performance with a-rate params: params the filter type does not use no longer force per-sample coefficients, frames whose params repeat reuse the coefficients before them, and a constant Q is converted once per quantum
 - Improved performance when nodes end: the render thread removes the nodes that ended in a quantum together, and with render groups patches the group plan instead of rebuilding it
 - New nodes reuse the input and output lists of removed ones instead of allocating them on the render thread
+- The control message channel of an `AudioContext` holds 4096 messages instead of 256, so building a large graph no longer blocks the control thread for a render callback per 256 messages; the render thread applies at most 256 between two render quanta
 
 ## Version 1.8.0 (2026-11-12)
 
