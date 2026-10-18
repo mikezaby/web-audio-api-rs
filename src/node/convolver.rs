@@ -1,13 +1,11 @@
 use std::any::Any;
 
-use fft_convolver::FFTConvolver;
-
 use crate::buffer::AudioBuffer;
 use crate::context::{AudioContextRegistration, BaseAudioContext};
+use crate::convolution::{Convolver, Terms};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
-use crate::RENDER_QUANTUM_SIZE;
 
 use super::{AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation};
 
@@ -221,10 +219,9 @@ impl ConvolverNode {
 
         let mut node = context.base().register(move |registration| {
             let renderer = ConvolverRenderer {
-                convolvers: None,
-                impulse_length: 0,
+                convolver: None,
                 impulse_number_of_channels: 0,
-                tail_count: 0,
+                input_number_of_channels: 1,
             };
 
             let node = Self {
@@ -291,16 +288,13 @@ impl ConvolverNode {
 }
 
 struct ConvolverInfosMessage {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
-    impulse_length: usize,
+    convolver: Option<Convolver>,
     impulse_number_of_channels: usize,
 }
 
 impl ConvolverInfosMessage {
-    /// Prepare the convolvers for an impulse response, on the control thread
+    /// Prepare the convolution of an impulse response, on the control thread
     fn new(buffer: &AudioBuffer, normalize: bool) -> Self {
-        let number_of_channels = buffer.number_of_channels();
-
         // normalize before padding because the length of the buffer affects the scale
         let scale = if normalize {
             normalize_buffer(buffer)
@@ -308,44 +302,44 @@ impl ConvolverInfosMessage {
             1.
         };
 
-        let mut convolvers = Vec::<FFTConvolver<f32>>::new();
-        // @note - value defined by "rule of thumb", to be explored further
-        let partition_size = RENDER_QUANTUM_SIZE * 8;
-
-        // Handle multichannel IR
-        // cf. https://webaudio.github.io/web-audio-api/#Convolution-channel-configurations
-        // Note that in case of mono IR we create 2 convolvers to properly handle stereo input
-        for index in 0..number_of_channels.max(2) {
-            // make sure we don't try to access an inexisting channel, cf. note above
-            let channel = index.min(number_of_channels - 1);
-
-            let mut scaled_channel = vec![0.; buffer.length()];
-            scaled_channel
-                .iter_mut()
-                .zip(buffer.get_channel_data(channel))
-                .for_each(|(o, i)| *o = *i * scale);
-
-            let mut convolver = FFTConvolver::<f32>::default();
-            convolver
-                .init(partition_size, &scaled_channel)
-                .expect("Unable to initialize convolution engine");
-
-            convolvers.push(convolver);
-        }
+        let impulse: Vec<Vec<f32>> = (0..buffer.number_of_channels())
+            .map(|channel| {
+                buffer
+                    .get_channel_data(channel)
+                    .iter()
+                    .map(|v| v * scale)
+                    .collect()
+            })
+            .collect();
 
         Self {
-            convolvers: Some(convolvers),
-            impulse_length: buffer.length(),
-            impulse_number_of_channels: number_of_channels,
+            convolver: Some(Convolver::new(&impulse)),
+            impulse_number_of_channels: buffer.number_of_channels(),
         }
     }
 }
 
+/// The (lane, impulse channel) terms of each output channel per input and
+/// impulse channel count. Lane 0 takes input channel 0, lane 1 input channel
+/// 1, or channel 0 again for a mono input that has two outputs.
+// cf. https://webaudio.github.io/web-audio-api/#Convolution-channel-configurations
+fn routing(input_channels: usize, impulse_channels: usize) -> &'static [Terms] {
+    match (input_channels, impulse_channels) {
+        (1, 1) => &[&[(0, 0)]],
+        (1, 2) | (2, 2) => &[&[(0, 0)], &[(1, 1)]],
+        (2, 1) => &[&[(0, 0)], &[(1, 0)]],
+        // true stereo; a mono input is upmixed to stereo first
+        (1, 4) | (2, 4) => &[&[(0, 0), (1, 2)], &[(0, 1), (1, 3)]],
+        _ => unreachable!(),
+    }
+}
+
 struct ConvolverRenderer {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
-    impulse_length: usize,
+    convolver: Option<Convolver>,
     impulse_number_of_channels: usize,
-    tail_count: usize,
+    /// channel count of the last input that was heard, so a silent quantum
+    /// (a single channel) does not cut the other channels' tail
+    input_number_of_channels: usize,
 }
 
 impl AudioProcessor for ConvolverRenderer {
@@ -360,138 +354,51 @@ impl AudioProcessor for ConvolverRenderer {
         let input = &inputs[0];
         let output = &mut outputs[0];
 
-        // handle tail time and active processing
-        // return early if input is silent and we reached the end of the convolution
-        if input.is_silent() {
-            if self.tail_count >= self.impulse_length {
-                output.make_silent();
-                return false;
-            }
-
-            self.tail_count += RENDER_QUANTUM_SIZE;
-        } else {
-            self.tail_count = 0;
-        }
-
-        let convolvers = match &mut self.convolvers {
+        let convolver = match &mut self.convolver {
             None => {
                 // no convolution buffer set, passthrough
                 *output = input.clone();
                 return !input.is_silent();
             }
-            Some(convolvers) => convolvers,
+            Some(convolver) => convolver,
         };
 
-        // https://webaudio.github.io/web-audio-api/#Convolution-channel-configurations
-        match (input.number_of_channels(), self.impulse_number_of_channels) {
-            (1, 1) => {
-                output.set_number_of_channels(1);
-
-                let i = &input.channel_data(0)[..];
-                let o = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i, o);
+        // return early if the input is silent and the convolution rang out
+        if input.is_silent() {
+            if convolver.is_silent() {
+                output.make_silent();
+                return false;
             }
-            (1, 2) => {
-                output.set_number_of_channels(2);
+        } else {
+            self.input_number_of_channels = input.number_of_channels();
+        }
 
-                let i = &input.channel_data(0)[..];
+        let terms = routing(
+            self.input_number_of_channels,
+            self.impulse_number_of_channels,
+        );
 
-                let o_left = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i, o_left);
+        let lanes = if input.is_silent() {
+            [None, None]
+        } else if input.number_of_channels() == 1 {
+            let mono = &input.channel_data(0)[..];
+            [Some(mono), (terms.len() > 1).then_some(mono)]
+        } else {
+            [
+                Some(&input.channel_data(0)[..]),
+                Some(&input.channel_data(1)[..]),
+            ]
+        };
 
-                let o_right = &mut output.channel_data_mut(1)[..];
-                let _ = convolvers[1].process(i, o_right);
-            }
-            (2, 1) => {
-                output.set_number_of_channels(2);
-
-                let i_left = &input.channel_data(0)[..];
-                let o_left = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i_left, o_left);
-
-                let i_right = &input.channel_data(1)[..];
-                let o_right = &mut output.channel_data_mut(1)[..];
-                let _ = convolvers[1].process(i_right, o_right);
-            }
-            (2, 2) => {
-                output.set_number_of_channels(2);
-
-                let i_left = &input.channel_data(0)[..];
-                let o_left = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i_left, o_left);
-
-                let i_right = &input.channel_data(1)[..];
-                let o_right = &mut output.channel_data_mut(1)[..];
-                let _ = convolvers[1].process(i_right, o_right);
-            }
-            (2, 4) => {
-                output.set_number_of_channels(4);
-
-                let i_left = &input.channel_data(0)[..];
-
-                let o_0 = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i_left, o_0);
-                let o_1 = &mut output.channel_data_mut(1)[..];
-                let _ = convolvers[1].process(i_left, o_1);
-
-                let i_right = &input.channel_data(1)[..];
-
-                let o_2 = &mut output.channel_data_mut(2)[..];
-                let _ = convolvers[2].process(i_right, o_2);
-                let o_3 = &mut output.channel_data_mut(3)[..];
-                let _ = convolvers[3].process(i_right, o_3);
-
-                // mix output back to stereo
-                let o_2 = output.channel_data(2).clone();
-                let o_3 = output.channel_data(3).clone();
-
-                output
-                    .channel_data_mut(0)
-                    .iter_mut()
-                    .zip(o_2.iter())
-                    .for_each(|(l, sl)| *l += *sl);
-
-                output
-                    .channel_data_mut(1)
-                    .iter_mut()
-                    .zip(o_3.iter())
-                    .for_each(|(r, sr)| *r += *sr);
-
-                output.set_number_of_channels(2);
-            }
-            (1, 4) => {
-                output.set_number_of_channels(4);
-
-                let i = &input.channel_data(0)[..];
-
-                let o_0 = &mut output.channel_data_mut(0)[..];
-                let _ = convolvers[0].process(i, o_0);
-                let o_1 = &mut output.channel_data_mut(1)[..];
-                let _ = convolvers[1].process(i, o_1);
-                let o_2 = &mut output.channel_data_mut(2)[..];
-                let _ = convolvers[2].process(i, o_2);
-                let o_3 = &mut output.channel_data_mut(3)[..];
-                let _ = convolvers[3].process(i, o_3);
-
-                // mix output back to stereo
-                let o_2 = output.channel_data(2).clone();
-                let o_3 = output.channel_data(3).clone();
-
-                output
-                    .channel_data_mut(0)
-                    .iter_mut()
-                    .zip(o_2.iter())
-                    .for_each(|(l, sl)| *l += *sl);
-
-                output
-                    .channel_data_mut(1)
-                    .iter_mut()
-                    .zip(o_3.iter())
-                    .for_each(|(r, sr)| *r += *sr);
-
-                output.set_number_of_channels(2);
-            }
+        output.set_number_of_channels(terms.len());
+        let heard = match output.channels_mut() {
+            [mono] => convolver.process(lanes, terms, &mut [&mut mono[..]]),
+            [left, right] => convolver.process(lanes, terms, &mut [&mut left[..], &mut right[..]]),
             _ => unreachable!(),
+        };
+
+        if !heard {
+            output.make_silent();
         }
 
         true
@@ -500,16 +407,12 @@ impl AudioProcessor for ConvolverRenderer {
     fn onmessage(&mut self, msg: &mut dyn Any) {
         if let Some(msg) = msg.downcast_mut::<ConvolverInfosMessage>() {
             let ConvolverInfosMessage {
-                convolvers,
-                impulse_length,
+                convolver,
                 impulse_number_of_channels,
             } = msg;
             // Avoid deallocation in the render thread by swapping the convolver.
-            std::mem::swap(&mut self.convolvers, convolvers);
-            self.impulse_length = *impulse_length;
+            std::mem::swap(&mut self.convolver, convolver);
             self.impulse_number_of_channels = *impulse_number_of_channels;
-            // fresh convolvers have nothing to ring out until the input is heard
-            self.tail_count = self.impulse_length;
 
             return;
         }
@@ -692,10 +595,9 @@ mod tests {
 
         let ir = AudioBuffer::from(vec![vec![1.; 48000]], 48000.);
         let mut renderer = ConvolverRenderer {
-            convolvers: None,
-            impulse_length: 0,
+            convolver: None,
             impulse_number_of_channels: 0,
-            tail_count: 0,
+            input_number_of_channels: 1,
         };
         renderer.onmessage(&mut ConvolverInfosMessage::new(&ir, true));
 

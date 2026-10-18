@@ -59,6 +59,7 @@ pub use spatial::AudioListener;
 mod io;
 
 mod analysis;
+mod convolution;
 mod message;
 
 mod decoding;

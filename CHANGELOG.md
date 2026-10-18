@@ -12,6 +12,7 @@
 - Improved performance: an a-rate `AudioParam` whose values are equal over a render quantum (a constant input or an automation at rest) is passed to its node as a single value
 - Improved `GainNode` performance with an a-rate gain
 - Improved performance: a `ConvolverNode` given a new buffer no longer renders a silent tail for the impulse length before its input is heard
+- Improved `ConvolverNode` performance: a non-uniform partitioned convolution spreads the work of its long partitions over the render quanta of a block, so the cost per quantum is lower and even (a 3 s stereo impulse response went from 44 to 10 us per quantum on an M1, the worst quantum from 353 to 141 us). The `fft-convolver` dependency is gone
 
 ## Version 1.7.0 (2026-08-06)
 
