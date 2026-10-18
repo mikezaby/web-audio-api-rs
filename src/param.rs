@@ -1365,6 +1365,12 @@ impl AudioParamProcessor {
         }
 
         if !ended {
+            // the event starts in a later block: hold the current value, the
+            // formula would extrapolate before T0
+            if infos.next_block_time < start_time {
+                return true;
+            }
+
             // compute value for `next_block_time` so that `param.value()`
             // stays coherent (see. comment in `AudioParam`)
             // allows to properly fill k-rate within next block too
@@ -1468,6 +1474,11 @@ impl AudioParamProcessor {
 
         // event will continue in next tick
         if end_time >= infos.next_block_time {
+            // the curve starts in a later block: hold the current value
+            if infos.next_block_time < start_time {
+                return true;
+            }
+
             // compute value for `next_block_time` so that `param.value()`
             // stays coherent (see. comment in `AudioParam`)
             // allows to properly fill k-rate within next block too
@@ -2643,6 +2654,41 @@ mod tests {
     }
 
     #[test]
+    fn test_set_target_at_time_starting_in_a_later_block() {
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        for automation_rate in [AutomationRate::A, AutomationRate::K] {
+            let opts = AudioParamDescriptor {
+                name: String::new(),
+                automation_rate,
+                default_value: 0.,
+                min_value: 0.,
+                max_value: 2.,
+            };
+            let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+
+            render.handle_incoming_event(param.set_value_at_time_raw(1., 0.));
+            render.handle_incoming_event(param.set_target_at_time_raw(0., 25., 1.));
+
+            // k-rate shows the value set at t=0 from the next block on
+            render.compute_intrinsic_values(0., 1., 10);
+            let vs = render.compute_intrinsic_values(10., 1., 10);
+            assert!(vs.iter().all(|&v| v == 1.), "{automation_rate:?} {vs:?}");
+
+            let vs = render.compute_intrinsic_values(20., 1., 10);
+            if automation_rate.is_a_rate() {
+                assert_float_eq!(vs[..5], [1.; 5][..], abs_all <= 0.);
+                for (t, v) in (25..30).zip(&vs[5..]) {
+                    let expected = (-(t as f64 - 25.)).exp() as f32;
+                    assert_float_eq!(*v, expected, abs <= 0.);
+                }
+            } else {
+                assert_float_eq!(vs[0], 1., abs <= 0.);
+            }
+        }
+    }
+
+    #[test]
     fn test_set_target_at_time_a_rate_followed_by_ramp() {
         let context = OfflineAudioContext::new(1, 1, 48000.);
         {
@@ -3202,6 +3248,35 @@ mod tests {
 
         let vs = render.compute_intrinsic_values(20., 1., 10);
         assert_float_eq!(vs, &[0.; 10][..], abs_all <= 0.);
+    }
+
+    #[test]
+    fn test_set_value_curve_at_time_starting_in_a_later_block() {
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 0.,
+            min_value: 0.,
+            max_value: 10.,
+        };
+        let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+
+        let curve = [0., 0.5];
+        render.handle_incoming_event(param.set_value_at_time_raw(1., 0.));
+        render.handle_incoming_event(param.set_value_curve_at_time_raw(&curve[..], 25., 10.));
+
+        let vs = render.compute_intrinsic_values(0., 1., 10);
+        assert!(vs.iter().all(|&v| v == 1.), "{vs:?}");
+        let vs = render.compute_intrinsic_values(10., 1., 10);
+        assert!(vs.iter().all(|&v| v == 1.), "{vs:?}");
+        let vs = render.compute_intrinsic_values(20., 1., 10);
+        assert_float_eq!(
+            vs,
+            &[1., 1., 1., 1., 1., 0., 0.05, 0.1, 0.15, 0.2][..],
+            abs_all <= 1e-7
+        );
     }
 
     #[test]
