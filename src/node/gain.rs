@@ -157,7 +157,8 @@ impl AudioProcessor for GainRenderer {
             return false;
         }
 
-        let gain = params.get(&self.gain);
+        let gain_values = params.get(&self.gain);
+        let gain: &[f32] = &gain_values;
 
         // very fast track for mute or pass-through
         if gain.len() == 1 {
@@ -188,9 +189,10 @@ impl AudioProcessor for GainRenderer {
             });
         } else {
             output.channels_mut().iter_mut().for_each(|channel| {
+                // an a-rate gain is a full quantum here, a plain zip vectorises
                 channel
                     .iter_mut()
-                    .zip(gain.iter().cycle())
+                    .zip(gain.iter())
                     .for_each(|(o, g)| *o *= g);
             });
         }
