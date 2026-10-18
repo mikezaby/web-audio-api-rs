@@ -15,6 +15,7 @@
 - Improved `GainNode` performance: an a-rate gain vectorises, and the product is written into the output instead of copying the input there first
 - Improved performance: an `AudioParam` with no automation pending and no input skips its rendering until a value or an input arrives
 - `WaveShaperNode` builds its resamplers only for the oversample factor in use, on the control thread (creating one without oversampling went from 0.05 to 0.001 ms on an M1)
+- Non-standard `worklet::AudioParamValues::get_by_index` returns a param's values by its position in `parameter_descriptors`, as a slice that lives for the whole `process` call
 
 ## Version 1.8.0 (2026-11-12)
 

@@ -228,6 +228,32 @@ impl<'a> AudioParamValues<'a> {
         DerefAudioRenderQuantumChannel(self.nodes.get_unchecked(index.into()).borrow())
     }
 
+    /// The values of a param for this quantum, as a slice that lives for `'a`, with no borrow
+    /// guard to hold
+    ///
+    /// # Panics
+    ///
+    /// Panics when the param node is borrowed mutably, which the render loop never does while
+    /// its owner processes.
+    pub(crate) fn get_unguarded(&self, index: &AudioParamId) -> &'a [f32] {
+        let node = self.nodes.get_unchecked(index.into());
+        // SAFETY: a param renders before its owner, in its owner's render group (they are joined
+        // by a hidden edge). Until the owner's processing ends, nothing borrows the param
+        // mutably: nodes after the owner add into its input only on the same thread, once the
+        // owner returned, and other threads render other groups. The check below fails loudly
+        // should that ever change.
+        let node = unsafe { node.try_borrow_unguarded() }
+            .expect("AudioParam borrowed mutably while its owner processes");
+        let buffer = node.get_buffer();
+        let len = if buffer.single_valued() {
+            1
+        } else {
+            RENDER_QUANTUM_SIZE
+        };
+
+        &buffer.channel_data(0)[..len]
+    }
+
     pub(crate) fn listener_params(&self) -> [impl Deref<Target = [f32]> + '_; 9] {
         crate::context::LISTENER_AUDIO_PARAM_IDS.map(|p| self.get(&p))
     }
