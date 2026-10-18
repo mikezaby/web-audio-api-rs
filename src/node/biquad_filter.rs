@@ -37,7 +37,7 @@ fn normalize_coefs(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Coef
     }
 }
 
-fn get_lowpass_coefs(freq: f64, q: f64) -> Coefficients {
+fn get_lowpass_coefs(freq: f64, q_gain: f64) -> Coefficients {
     if freq == 1. {
         // The formula below works, except for roundoff.  When freq = 1,
         // the filter is just a wire, so hardwire the coefficients.
@@ -50,7 +50,7 @@ fn get_lowpass_coefs(freq: f64, q: f64) -> Coefficients {
         }
     } else {
         let w0 = PI * freq;
-        let alpha_q_db = w0.sin() / (2. * 10_f64.powf(q / 20.));
+        let alpha_q_db = w0.sin() / (2. * q_gain);
         let cos_w0 = w0.cos();
         let beta = (1. - cos_w0) / 2.;
 
@@ -65,7 +65,7 @@ fn get_lowpass_coefs(freq: f64, q: f64) -> Coefficients {
     }
 }
 
-fn get_highpass_coefs(freq: f64, q: f64) -> Coefficients {
+fn get_highpass_coefs(freq: f64, q_gain: f64) -> Coefficients {
     if freq == 1. {
         // The filter is 0
         Coefficients {
@@ -88,7 +88,7 @@ fn get_highpass_coefs(freq: f64, q: f64) -> Coefficients {
         }
     } else {
         let w0 = PI * freq;
-        let alpha_q_db = w0.sin() / (2. * 10_f64.powf(q / 20.));
+        let alpha_q_db = w0.sin() / (2. * q_gain);
         let cos_w0 = w0.cos();
         let beta = (1. + cos_w0) / 2.;
 
@@ -347,13 +347,43 @@ fn calculate_coefs(
     gain: f64,
     q: f64,
 ) -> Coefficients {
+    let q_gain = if takes_q_gain(filter_type) {
+        q_gain(q)
+    } else {
+        0.
+    };
+    calculate_coefs_with_q_gain(filter_type, sample_rate, f0, gain, q, q_gain)
+}
+
+fn takes_q_gain(filter_type: BiquadFilterType) -> bool {
+    matches!(
+        filter_type,
+        BiquadFilterType::Lowpass | BiquadFilterType::Highpass
+    )
+}
+
+/// The form lowpass and highpass take Q in, in dB
+fn q_gain(q: f64) -> f64 {
+    10_f64.powf(q / 20.)
+}
+
+/// `calculate_coefs` with `q_gain(q)` computed by the caller, so a quantum
+/// with a constant Q computes it once
+fn calculate_coefs_with_q_gain(
+    filter_type: BiquadFilterType,
+    sample_rate: f64,
+    f0: f64,
+    gain: f64,
+    q: f64,
+    q_gain: f64,
+) -> Coefficients {
     // convert computed f0 (including detune) to normalized clamped value
     let nyquist = sample_rate / 2.;
     let norm_freq = (f0 / nyquist).clamp(0., 1.);
 
     match filter_type {
-        BiquadFilterType::Lowpass => get_lowpass_coefs(norm_freq, q),
-        BiquadFilterType::Highpass => get_highpass_coefs(norm_freq, q),
+        BiquadFilterType::Lowpass => get_lowpass_coefs(norm_freq, q_gain),
+        BiquadFilterType::Highpass => get_highpass_coefs(norm_freq, q_gain),
         BiquadFilterType::Bandpass => get_bandpass_coefs(norm_freq, q),
         BiquadFilterType::Notch => get_notch_coefs(norm_freq, q),
         BiquadFilterType::Allpass => get_allpass_coefs(norm_freq, q),
@@ -832,26 +862,59 @@ impl AudioProcessor for BiquadFilterRenderer {
         );
 
         let mut coefs_list = [coef; RENDER_QUANTUM_SIZE];
+        // params the filter type does not read cannot change the coefs
+        let uses_q = !matches!(
+            type_,
+            BiquadFilterType::Lowshelf | BiquadFilterType::Highshelf
+        );
+        let uses_gain = matches!(
+            type_,
+            BiquadFilterType::Peaking | BiquadFilterType::Lowshelf | BiquadFilterType::Highshelf
+        );
         // if one of the params has a length of RENDER_QUANTUM_SIZE, we need
         // to compute the coefs for each frame
-        if frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1 {
-            coefs_list
-                .iter_mut()
-                .zip(frequency.iter().cycle())
-                .zip(detune.iter().cycle())
-                .zip(q.iter().cycle())
-                .zip(gain.iter().cycle())
-                .skip(1)
-                .for_each(|((((coefs, &f), &d), &q), &g)| {
-                    let computed_freq = get_computed_freq(f, d);
-                    *coefs = calculate_coefs(
+        if frequency.len() != 1
+            || detune.len() != 1
+            || (uses_q && q.len() != 1)
+            || (uses_gain && gain.len() != 1)
+        {
+            let takes_q_gain = takes_q_gain(type_);
+            let constant_q_gain = (q.len() == 1).then(|| q_gain(f64::from(q[0])));
+            let mut previous = (frequency[0], detune[0], q[0], gain[0]);
+            let mut last = coef;
+
+            for (i, coefs) in coefs_list.iter_mut().enumerate().skip(1) {
+                let f = frequency[i.min(frequency.len() - 1)];
+                let d = detune[i.min(detune.len() - 1)];
+                let q = q[i.min(q.len() - 1)];
+                let g = gain[i.min(gain.len() - 1)];
+
+                // a param that holds its value keeps the coefs of the frame before
+                let unchanged = f.to_bits() == previous.0.to_bits()
+                    && d.to_bits() == previous.1.to_bits()
+                    && (!uses_q || q.to_bits() == previous.2.to_bits())
+                    && (!uses_gain || g.to_bits() == previous.3.to_bits());
+                previous = (f, d, q, g);
+
+                if !unchanged {
+                    let computed_freq = f64::from(get_computed_freq(f, d));
+                    let q = f64::from(q);
+                    let q_gain = match constant_q_gain {
+                        Some(q_gain) if takes_q_gain => q_gain,
+                        _ if takes_q_gain => q_gain(q),
+                        _ => 0.,
+                    };
+                    last = calculate_coefs_with_q_gain(
                         type_,
                         sample_rate_f64,
-                        f64::from(computed_freq),
+                        computed_freq,
                         f64::from(g),
-                        f64::from(q),
+                        q,
+                        q_gain,
                     );
-                });
+                }
+                *coefs = last;
+            }
         };
 
         for (channel_number, output_channel) in output.channels_mut().iter_mut().enumerate() {
