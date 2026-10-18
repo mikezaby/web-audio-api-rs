@@ -20,7 +20,10 @@ use std::ops::{Deref, DerefMut};
 /// Accessor for current [`AudioParam`] values
 pub struct AudioParamValues<'a> {
     values: crate::render::AudioParamValues<'a>,
-    map: &'a HashMap<String, AudioParamId, rustc_hash::FxBuildHasher>,
+    /// Position of each param in `ids`
+    map: &'a HashMap<String, usize, rustc_hash::FxBuildHasher>,
+    /// Params in the order of the processor's `parameter_descriptors`
+    ids: &'a [AudioParamId],
 }
 
 impl std::fmt::Debug for AudioParamValues<'_> {
@@ -37,8 +40,22 @@ impl<'a> AudioParamValues<'a> {
     /// provide a slice of length equal to the render quantum size (default: 128)
     #[allow(clippy::missing_panics_doc)]
     pub fn get(&'a self, name: &str) -> impl Deref<Target = [f32]> + 'a {
-        let id = self.map.get(name).unwrap();
-        self.values.get(id)
+        let index = *self.map.get(name).unwrap();
+        self.values.get(&self.ids[index])
+    }
+
+    /// Get the computed values for the [`AudioParam`] at `index` in the processor's
+    /// `parameter_descriptors`
+    ///
+    /// Like [`Self::get`], looked up by position rather than by name, and as a slice that lives
+    /// as long as this `AudioParamValues`, so a processor can hold the values of every param at
+    /// once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is out of bounds.
+    pub fn get_by_index(&self, index: usize) -> &'a [f32] {
+        self.values.get_unguarded(&self.ids[index])
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -247,6 +264,7 @@ impl AudioWorkletNode {
             let mut node_param_map = HashMap::new();
             // Parameter names come from the processor; favor fast lookups on the render thread.
             let mut processor_param_map = HashMap::with_hasher(rustc_hash::FxBuildHasher);
+            let mut processor_param_ids = Vec::new();
             for mut param_descriptor in P::parameter_descriptors() {
                 let name = std::mem::take(&mut param_descriptor.name);
                 let (param, proc) = context.create_audio_param(param_descriptor, &registration);
@@ -254,7 +272,8 @@ impl AudioWorkletNode {
                     param.set_value(*value as f32); // mismatch in spec f32 vs f64
                 }
                 node_param_map.insert(name.clone(), param);
-                processor_param_map.insert(name, proc);
+                processor_param_map.insert(name, processor_param_ids.len());
+                processor_param_ids.push(proc);
             }
 
             let node = AudioWorkletNode {
@@ -268,6 +287,7 @@ impl AudioWorkletNode {
             let render: AudioWorkletRenderer<P> = AudioWorkletRenderer {
                 processor: Processor::new(processor_options),
                 audio_param_map: processor_param_map,
+                audio_param_ids: processor_param_ids,
                 output_channel_count,
                 inputs_flat: Vec::with_capacity(number_of_inputs * MAX_CHANNELS),
                 inputs_grouped: Vec::with_capacity(number_of_inputs),
@@ -323,7 +343,8 @@ impl<P: AudioWorkletProcessor> Processor<P> {
 
 struct AudioWorkletRenderer<P: AudioWorkletProcessor> {
     processor: Processor<P>,
-    audio_param_map: HashMap<String, AudioParamId, rustc_hash::FxBuildHasher>,
+    audio_param_map: HashMap<String, usize, rustc_hash::FxBuildHasher>,
+    audio_param_ids: Vec<AudioParamId>,
     output_channel_count: Vec<usize>,
 
     // Preallocated, reusable containers for channel data
@@ -438,6 +459,7 @@ impl<P: AudioWorkletProcessor> AudioProcessor for AudioWorkletRenderer<P> {
         let param_getter = AudioParamValues {
             values: params,
             map: &self.audio_param_map,
+            ids: &self.audio_param_ids,
         };
 
         let tail_time = processor.process(
@@ -490,6 +512,62 @@ mod tests {
         ) -> bool {
             true
         }
+    }
+
+    struct ParamsProcessor {
+        seen: Arc<std::sync::Mutex<Vec<(f32, f32)>>>,
+    }
+
+    impl AudioWorkletProcessor for ParamsProcessor {
+        type ProcessorOptions = Arc<std::sync::Mutex<Vec<(f32, f32)>>>;
+
+        fn constructor(seen: Self::ProcessorOptions) -> Self {
+            Self { seen }
+        }
+
+        fn parameter_descriptors() -> Vec<AudioParamDescriptor> {
+            ["a", "b"]
+                .iter()
+                .map(|name| AudioParamDescriptor {
+                    name: (*name).to_string(),
+                    min_value: 0.,
+                    max_value: 10.,
+                    default_value: 0.,
+                    automation_rate: crate::AutomationRate::A,
+                })
+                .collect()
+        }
+
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            _outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            // both at once, by position, in the order of `parameter_descriptors`
+            let (a, b) = (params.get_by_index(0), params.get_by_index(1));
+            assert_eq!(a, &params.get("a")[..]);
+            assert_eq!(b, &params.get("b")[..]);
+            self.seen.lock().unwrap().push((a[0], b[0]));
+            true
+        }
+    }
+
+    #[test]
+    fn test_worklet_params_by_index() {
+        let mut context = OfflineAudioContext::new(1, 128, 48000.);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = AudioWorkletNodeOptions {
+            parameter_data: HashMap::from([("a".to_string(), 1.), ("b".to_string(), 2.)]),
+            processor_options: Arc::clone(&seen),
+            ..AudioWorkletNodeOptions::default()
+        };
+        let worklet = AudioWorkletNode::new::<ParamsProcessor>(&context, options);
+        worklet.connect(&context.destination());
+        let _ = context.start_rendering_sync();
+
+        assert_eq!(seen.lock().unwrap()[..], [(1., 2.)]);
     }
 
     #[test]
