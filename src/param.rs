@@ -794,6 +794,17 @@ impl AudioParamProcessor {
                     }
                 });
         }
+
+        // An a-rate block that holds one value (an envelope at rest, a
+        // constant source) is passed on as one, so consumers take their
+        // constant paths
+        if !output.single_valued() {
+            let values = output.channel_data(0);
+            let first = values[0].to_bits();
+            if values.iter().fold(0, |acc, v| acc | (v.to_bits() ^ first)) == 0 {
+                output.set_single_valued(true);
+            }
+        }
     }
 
     fn handle_incoming_event(&mut self, event: AudioParamEvent) {
@@ -3571,6 +3582,63 @@ mod tests {
         // expect only 1, not the other values
         assert!(output.single_valued());
         assert_float_eq!(output.channel_data(0)[0], 1., abs <= 0.);
+    }
+
+    #[test]
+    fn test_a_rate_constant_input_is_single_valued() {
+        let alloc = Alloc::with_capacity(1);
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 1.,
+            min_value: 0.,
+            max_value: 10.,
+        };
+        let (_param, mut render) = audio_param_pair(opts, context.mock_registration());
+        render.compute_intrinsic_values(0., 1., 128);
+
+        let mut input = AudioRenderQuantum::from(alloc.silence());
+        input.channel_data_mut(0).fill(0.5);
+        let mut output = AudioRenderQuantum::from(alloc.silence());
+        render.mix_to_output(&input, &mut output);
+
+        assert!(output.single_valued());
+        assert_float_eq!(output.channel_data(0)[0], 1.5, abs <= 0.);
+
+        input.channel_data_mut(0)[127] = 0.25;
+        render.mix_to_output(&input, &mut output);
+
+        assert!(!output.single_valued());
+        assert_float_eq!(output.channel_data(0)[0], 1.5, abs <= 0.);
+        assert_float_eq!(output.channel_data(0)[127], 1.25, abs <= 0.);
+    }
+
+    #[test]
+    fn test_a_rate_automation_holding_one_value_is_single_valued() {
+        let alloc = Alloc::with_capacity(1);
+        let context = OfflineAudioContext::new(1, 1, 48000.);
+
+        let opts = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 0.,
+            min_value: 0.,
+            max_value: 10.,
+        };
+        let (param, mut render) = audio_param_pair(opts, context.mock_registration());
+        // a value set at the block start fills the a-rate buffer with it
+        render.handle_incoming_event(param.set_value_at_time_raw(3., 0.));
+        let vs = render.compute_intrinsic_values(0., 1., 128);
+        assert_eq!(vs.len(), 128);
+
+        let input = AudioRenderQuantum::from(alloc.silence());
+        let mut output = AudioRenderQuantum::from(alloc.silence());
+        render.mix_to_output(&input, &mut output);
+
+        assert!(output.single_valued());
+        assert_float_eq!(output.channel_data(0)[0], 3., abs <= 0.);
     }
 
     #[test]
