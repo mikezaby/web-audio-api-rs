@@ -357,7 +357,7 @@ impl AudioProcessor for ConvolverRenderer {
         let convolver = match &mut self.convolver {
             None => {
                 // no convolution buffer set, passthrough
-                *output = input.clone();
+                output.clone_from(input);
                 return !input.is_silent();
             }
             Some(convolver) => convolver,

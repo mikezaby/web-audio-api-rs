@@ -152,7 +152,7 @@ impl AudioProcessor for DestinationRenderer {
         let output = &mut outputs[0];
 
         // just move input to output
-        *output = input.clone();
+        output.clone_from(input);
 
         true
     }

@@ -189,12 +189,28 @@ impl std::ops::Drop for AudioRenderQuantumChannel {
 /// Audio buffers are managed with a dedicated allocator per render thread, hence there are no
 /// public constructors available. If you must create a new instance, copy an existing one and
 /// mutate it from there.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AudioRenderQuantum {
     channels: ArrayVec<AudioRenderQuantumChannel, MAX_CHANNELS>,
     // this field is only used by AudioParam so that when we know the param is
     // constant for a render_quantum it return a slice of length 1 instead of 128
     single_valued: bool,
+}
+
+impl Clone for AudioRenderQuantum {
+    fn clone(&self) -> Self {
+        Self {
+            channels: self.channels.clone(),
+            single_valued: self.single_valued,
+        }
+    }
+
+    // Touches the live channels only, where `*a = b.clone()` moves the whole struct, room for
+    // MAX_CHANNELS channels
+    fn clone_from(&mut self, source: &Self) {
+        self.channels.clone_from(&source.channels);
+        self.single_valued = source.single_valued;
+    }
 }
 
 impl AudioRenderQuantum {
@@ -523,6 +539,10 @@ impl AudioRenderQuantum {
     /// `O(1)` operation to convert this buffer to the 'silence buffer' which will enable some
     /// optimizations in the graph rendering.
     pub fn make_silent(&mut self) {
+        if self.channels.len() == 1 && self.channels[0].is_silent() {
+            return;
+        }
+
         let silence = self.channels[0].silence();
 
         self.channels[0] = silence;

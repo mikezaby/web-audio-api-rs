@@ -801,7 +801,7 @@ impl AudioProcessor for PannerRenderer {
             // channels into their respective kernel, and summing the result per ear.  This will
             // usually double the output volume as compared to mono-to-stereo.  Hence we double
             // the input signal for stereo inputs to correct for our lack of implementation.
-            *output = input.clone();
+            output.clone_from(input);
             let mut overall_gain_correction = 1.;
             if output.number_of_channels() == 2 {
                 overall_gain_correction *= 2.; // stereo-to-stereo panning typically doubles volume
@@ -846,7 +846,7 @@ impl AudioProcessor for PannerRenderer {
                 let param_value = a_rate_params.next().unwrap();
                 match input.number_of_channels() {
                     1 => {
-                        *output = input.clone();
+                        output.clone_from(input);
                         output.mix(2, ChannelInterpretation::Speakers);
                         let [left, right] = output.stereo_mut();
                         left.iter_mut()
@@ -872,7 +872,7 @@ impl AudioProcessor for PannerRenderer {
             } else {
                 match input.number_of_channels() {
                     1 => {
-                        *output = input.clone();
+                        output.clone_from(input);
                         output.mix(2, ChannelInterpretation::Speakers);
                         let [left, right] = output.stereo_mut();
                         a_rate_params
