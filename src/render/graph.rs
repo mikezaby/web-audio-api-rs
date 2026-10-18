@@ -132,6 +132,9 @@ impl Node {
     }
 }
 
+/// Most emptied input and output lists kept for new nodes
+const SPARE_QUANTA: usize = 256;
+
 /// Where the topological sort is with a node
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Visit {
@@ -166,6 +169,9 @@ pub(crate) struct Graph {
     workers: Option<Box<Workers>>,
     /// Nodes that ended this quantum, removed once every node rendered
     dropped: Vec<AudioNodeId>,
+    /// Emptied input and output lists of removed nodes, reused for new nodes so the render
+    /// thread neither frees nor allocates them
+    spare_quanta: Vec<Vec<AudioRenderQuantum>>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -191,6 +197,7 @@ impl Graph {
             plan: Box::default(),
             workers: None,
             dropped: Vec::with_capacity(64),
+            spare_quanta: Vec::with_capacity(SPARE_QUANTA),
         }
     }
 
@@ -292,8 +299,10 @@ impl Graph {
 
         // set input and output buffers to single channel of silence, will be upmixed when
         // necessary
-        let inputs = vec![AudioRenderQuantum::from(alloc.silence()); number_of_inputs];
-        let outputs = vec![AudioRenderQuantum::from(alloc.silence()); number_of_outputs];
+        let mut inputs = self.spare_quanta(number_of_inputs);
+        inputs.extend((0..number_of_inputs).map(|_| AudioRenderQuantum::from(alloc.silence())));
+        let mut outputs = self.spare_quanta(number_of_outputs);
+        outputs.extend((0..number_of_outputs).map(|_| AudioRenderQuantum::from(alloc.silence())));
 
         self.nodes.insert(
             index,
@@ -319,6 +328,14 @@ impl Graph {
         } else {
             // the node needs a place in its render group
             self.ordered.clear();
+        }
+    }
+
+    /// An empty list for `len` quanta, a spare one when there is one
+    fn spare_quanta(&mut self, len: usize) -> Vec<AudioRenderQuantum> {
+        match self.spare_quanta.iter().position(|v| v.capacity() >= len) {
+            Some(index) if len > 0 => self.spare_quanta.swap_remove(index),
+            _ => Vec::with_capacity(len),
         }
     }
 
@@ -718,12 +735,27 @@ impl Graph {
 
         for &index in dropped {
             // Node is dropped, remove it from the node list
-            let mut node = self.nodes.remove(index).into_inner();
-            self.reclaim_id_channel
-                .push(node.reclaim_id.take().unwrap());
+            let Node {
+                reclaim_id,
+                mut processor,
+                inputs,
+                outputs,
+                ..
+            } = self.nodes.remove(index).into_inner();
+            self.reclaim_id_channel.push(reclaim_id.unwrap());
             scope.node_id.set(index);
-            node.processor.before_drop(scope);
-            drop(node);
+            processor.before_drop(scope);
+            // Here, not on the garbage collector thread: a processor can hold buffers of this
+            // thread's pools (a delay line, a lookahead), which only this thread may release
+            drop(processor);
+
+            // the buffers go back to their pool, the lists are kept for new nodes
+            for mut quanta in [inputs, outputs] {
+                quanta.clear();
+                if quanta.capacity() > 0 && self.spare_quanta.len() < SPARE_QUANTA {
+                    self.spare_quanta.push(quanta);
+                }
+            }
         }
 
         // Nodes are only dropped when they do not have incoming connections.
@@ -1334,6 +1366,29 @@ mod tests {
             node_id: std::cell::Cell::new(AudioNodeId(0)),
             event_sender: crossbeam_channel::unbounded().0,
         }
+    }
+
+    #[test]
+    fn a_removed_node_leaves_its_lists_for_the_next() {
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        add_node(&mut graph, 2, Box::new(TestNode { tail_time: false }));
+        add_edge(&mut graph, 2, 0);
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(2))
+            .control_handle_dropped = true;
+
+        graph.render(&test_scope());
+        assert!(!graph.nodes.contains(AudioNodeId(2)));
+        assert_eq!(graph.spare_quanta.len(), 2);
+
+        add_node(&mut graph, 3, Box::new(TestNode { tail_time: false }));
+        assert_eq!(graph.spare_quanta.len(), 0);
+        assert_eq!(
+            graph.nodes.get_unchecked_mut(AudioNodeId(3)).inputs.len(),
+            1
+        );
     }
 
     #[test]

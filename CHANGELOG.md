@@ -16,6 +16,7 @@
 - Improved performance of a-rate `exponentialRampToValueAtTime` and `setTargetAtTime`: samples follow from the first one by a constant factor instead of a `powf` or `exp` each. Exponential ramps are computed in f64 and now land within one ULP of the spec formula, where they could be a few ULP off
 - Improved `BiquadFilterNode` performance with a-rate params: params the filter type does not use no longer force per-sample coefficients, frames whose params repeat reuse the coefficients before them, and a constant Q is converted once per quantum
 - Improved performance when nodes end: the render thread removes the nodes that ended in a quantum together, and with render groups patches the group plan instead of rebuilding it
+- New nodes reuse the input and output lists of removed ones instead of allocating them on the render thread
 
 ## Version 1.7.0 (2026-08-06)
 
