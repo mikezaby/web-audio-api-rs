@@ -262,6 +262,9 @@ impl AudioBackendManager for CpalBackend {
         }
         #[cfg(not(target_os = "macos"))]
         let workgroup = None;
+        // before the callback and the helpers start, which only look the cores up
+        #[cfg(target_os = "android")]
+        super::fast_cores::find();
 
         let default_device_config = device
             .default_output_config()
