@@ -16,6 +16,7 @@ use crate::message::ControlMessage;
 use crate::stats::AudioStats;
 use crate::RENDER_QUANTUM_SIZE;
 
+pub(crate) mod fast_cores;
 mod none;
 pub(crate) mod workgroup;
 pub(crate) use none::NoneBackend;

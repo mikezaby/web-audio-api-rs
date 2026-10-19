@@ -118,6 +118,7 @@ impl Workers {
                         // keeps the membership until the helper exits
                         let _member = real_time.as_ref().map(|rt| {
                             promote_to_real_time(rt.frames, sample_rate);
+                            crate::io::fast_cores::prefer();
                             join_workgroup(workgroup.as_deref())
                         });
                         helper(&queue, &work, &done, &shared, sample_rate, event_sender);

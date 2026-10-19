@@ -429,6 +429,8 @@ impl RenderThread {
         // Collect timing information
         let render_start = Instant::now();
         let frames = output_buffer.len() / self.number_of_channels;
+        // the backend may call from a new thread after a restart, so on every call
+        crate::io::fast_cores::prefer();
 
         // Perform actual rendering
 
