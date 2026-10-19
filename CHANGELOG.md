@@ -18,6 +18,7 @@
 - Non-standard `worklet::AudioParamValues::get_by_index` returns a param's values by its position in `parameter_descriptors`, as a slice that lives for the whole `process` call
 - Improved `AudioBufferSourceNode` performance off the aligned fast track (a start inside a render quantum, a playback rate, loop points): blocks away from the start, the stop and the loop points skip the per-sample checks
 - Fix: `DynamicsCompressorNode` delays its input by 6 ms, read like a `DelayNode` with a `delayTime` of 0.006 as in the spec's processing model, instead of by whole render quanta (8.7 ms at 44.1 kHz)
+- On Android the render thread and its helpers keep to the cores faster than the slowest ones, where the real-time callback of AAudio's low-latency path otherwise rendered on efficiency cores, three to four times slower
 
 ## Version 1.8.0 (2026-11-12)
 
