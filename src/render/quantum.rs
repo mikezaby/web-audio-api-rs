@@ -1,6 +1,6 @@
 //! Optimized audio signal data structures, used in `AudioProcessors`
 use arrayvec::ArrayVec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
@@ -9,6 +9,12 @@ use crate::assert_valid_number_of_channels;
 use crate::{MAX_CHANNELS, RENDER_QUANTUM_SIZE};
 
 // object pool for `AudioRenderQuantumChannel`s, only allocate if the pool is empty
+//
+// Buffers a pool makes for each node it serves, as the node registers: a stereo output of
+// every node at once, so a render takes what it needs from the pool instead of allocating
+// while it plays.
+pub(crate) const BUFFERS_PER_NODE: usize = 2;
+
 #[derive(Clone)]
 pub(crate) struct Alloc {
     inner: Rc<AllocInner>,
@@ -18,6 +24,10 @@ pub(crate) struct Alloc {
 struct AllocInner {
     pool: RefCell<Vec<Rc<[f32; RENDER_QUANTUM_SIZE]>>>,
     zeroes: Rc<[f32; RENDER_QUANTUM_SIZE]>,
+    /// Buffers this pool has made, in the pool or out
+    made: Cell<usize>,
+    /// Nodes of its render group
+    nodes: Cell<usize>,
 }
 
 impl Alloc {
@@ -28,6 +38,8 @@ impl Alloc {
         let inner = AllocInner {
             pool: RefCell::new(pool),
             zeroes,
+            made: Cell::new(n),
+            nodes: Cell::new(0),
         };
 
         Self {
@@ -67,6 +79,30 @@ impl Alloc {
     pub fn pool_size(&self) -> usize {
         self.inner.pool.borrow().len()
     }
+
+    /// A node of this pool's render group registers: the pool makes buffers until it has made
+    /// [`BUFFERS_PER_NODE`] for each, and room in its list for all it has made, so neither a
+    /// render nor a buffer coming back allocates. Nodes register as a patch loads or changes,
+    /// never while a module plays (Blibliki's ADR 127).
+    pub(crate) fn add_node(&self) {
+        let inner = &self.inner;
+        inner.nodes.set(inner.nodes.get() + 1);
+        let target = inner.nodes.get() * BUFFERS_PER_NODE;
+        let mut pool = inner.pool.borrow_mut();
+        while inner.made.get() < target {
+            pool.push(Rc::new([0.; RENDER_QUANTUM_SIZE]));
+            inner.made.set(inner.made.get() + 1);
+        }
+        let room = inner.made.get() - pool.len();
+        pool.reserve(room);
+    }
+
+    /// A node of this pool's render group is removed: the buffers stay, and the next nodes
+    /// count against them.
+    pub(crate) fn remove_node(&self) {
+        let nodes = &self.inner.nodes;
+        nodes.set(nodes.get().saturating_sub(1));
+    }
 }
 
 impl AllocInner {
@@ -76,6 +112,7 @@ impl AllocInner {
             rc
         } else {
             // allocate
+            self.made.set(self.made.get() + 1);
             Rc::new([0.; RENDER_QUANTUM_SIZE])
         }
     }
@@ -757,6 +794,34 @@ mod tests {
     use float_eq::assert_float_eq;
 
     use super::*;
+
+    #[test]
+    fn test_pool_fills_as_nodes_register() {
+        let alloc = Alloc::with_capacity(0);
+        (0..3).for_each(|_| alloc.add_node());
+        assert_eq!(alloc.pool_size(), 3 * BUFFERS_PER_NODE);
+
+        // the buffers its nodes take, and give back, come from the pool
+        alloc_counter::deny_alloc(|| {
+            let taken: ArrayVec<_, { 3 * BUFFERS_PER_NODE }> = (0..3 * BUFFERS_PER_NODE)
+                .map(|_| alloc.allocate())
+                .collect();
+            drop(taken);
+        });
+        assert_eq!(alloc.pool_size(), 3 * BUFFERS_PER_NODE);
+    }
+
+    #[test]
+    fn test_pool_follows_the_nodes_it_serves() {
+        let alloc = Alloc::with_capacity(0);
+        (0..3).for_each(|_| alloc.add_node());
+        alloc.remove_node();
+        alloc.remove_node();
+        alloc.add_node();
+
+        // two nodes now, and the buffers made for three stay
+        assert_eq!(alloc.pool_size(), 3 * BUFFERS_PER_NODE);
+    }
 
     #[test]
     fn test_pool() {

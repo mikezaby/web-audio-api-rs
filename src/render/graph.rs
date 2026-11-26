@@ -299,6 +299,7 @@ impl Graph {
                 alloc
             }
         };
+        alloc.add_node();
 
         // set input and output buffers to single channel of silence, will be upmixed when
         // necessary
@@ -744,8 +745,10 @@ impl Graph {
                 mut processor,
                 inputs,
                 outputs,
+                alloc,
                 ..
             } = self.nodes.remove(index).into_inner();
+            alloc.remove_node();
             self.reclaim_id_channel.push(reclaim_id.unwrap());
             scope.node_id.set(index);
             processor.before_drop(scope);
