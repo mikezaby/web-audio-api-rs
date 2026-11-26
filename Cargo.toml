@@ -56,7 +56,7 @@ vecmath = "1.0"
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 no_denormals = "0.3"
 
-[target.'cfg(target_os = "android")'.dependencies]
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

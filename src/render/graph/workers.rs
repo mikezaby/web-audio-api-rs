@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 
@@ -66,6 +66,9 @@ pub(crate) struct Workers {
     done: (Sender<()>, Receiver<()>),
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
+    /// Set for real-time helpers until they took the render thread's priority
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    match_render_thread: AtomicBool,
 }
 
 impl std::fmt::Debug for Workers {
@@ -133,7 +136,55 @@ impl Workers {
             done,
             shared,
             handles,
+            match_render_thread: AtomicBool::new(real_time.is_some()),
         }
+    }
+
+    /// Give each helper the render thread's real-time policy and priority, on Linux
+    ///
+    /// A helper promotes itself through `audio_thread_priority`, which asks for priority 10 there:
+    /// under every interrupt thread of a PREEMPT_RT kernel (50), while the render thread that waits
+    /// for it runs at what the backend gave it (65 under `jackd -P 70`). An interrupt then holds up
+    /// the render thread through its helper. Called once, from the render thread.
+    #[cfg(target_os = "linux")]
+    fn take_render_thread_priority(&self) {
+        use std::os::unix::thread::JoinHandleExt;
+        static WARNED: Once = Once::new();
+        // The kernel's flag, which an unprivileged thread cannot clear once set
+        const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
+
+        // The syscalls rather than pthread_getschedparam, whose answer glibc may have cached
+        // before the backend raised this thread.
+        // SAFETY: pid 0 is the calling thread, and a zeroed sched_param is valid
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        let policy = unsafe { libc::sched_getscheduler(0) } & !SCHED_RESET_ON_FORK;
+        let read = unsafe { libc::sched_getparam(0, &mut param) };
+        if read != 0 || (policy != libc::SCHED_FIFO && policy != libc::SCHED_RR) {
+            return;
+        }
+
+        for handle in &self.handles {
+            // SAFETY: the helper runs until `Workers` drops, which joins it
+            let set = unsafe {
+                libc::pthread_setschedparam(
+                    handle.as_pthread_t(),
+                    policy | SCHED_RESET_ON_FORK,
+                    &param,
+                )
+            };
+            if set != 0 {
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "Render helpers keep their priority, the render thread's: error {set}"
+                    );
+                });
+                return;
+            }
+        }
+        log::debug!(
+            "Render helpers run at the render thread's priority {}",
+            param.sched_priority
+        );
     }
 
     /// Render every group of `plan`, on the helpers and this thread, return when all finished
@@ -143,6 +194,12 @@ impl Workers {
         plan: &GroupPlan,
         scope: &AudioWorkletGlobalScope,
     ) {
+        #[cfg(target_os = "linux")]
+        if self.match_render_thread.load(Ordering::Relaxed) {
+            self.match_render_thread.store(false, Ordering::Relaxed);
+            self.take_render_thread_priority();
+        }
+
         // SAFETY: no group of this quantum is queued yet, so no helper reads the job, see `Shared`
         unsafe {
             *self.shared.job.get() = Job {
