@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use dasp_sample::FromSample;
 use futures_channel::{mpsc, oneshot};
 use futures_util::StreamExt as _;
@@ -20,7 +20,7 @@ use crate::context::{
     AudioContextState, AudioNodeId, OfflineAudioContext, OfflineAudioContextCallback,
 };
 use crate::events::{EventDispatch, EventLoop};
-use crate::message::ControlMessage;
+use crate::message::{ControlMessage, ControlReceiver};
 use crate::node::ChannelInterpretation;
 use crate::render::AudioWorkletGlobalScope;
 use crate::stats::AudioStats;
@@ -40,7 +40,7 @@ pub(crate) struct RenderThread {
     state: Arc<AtomicU8>,
     startup_pending: Option<Arc<AtomicBool>>,
     frames_played: Arc<AtomicU64>,
-    receiver: Option<Receiver<ControlMessage>>,
+    receiver: Option<ControlReceiver>,
     buffer_offset: Option<(usize, AudioRenderQuantum)>,
     stats: AudioStats,
     event_sender: Sender<EventDispatch>,
@@ -84,7 +84,7 @@ impl RenderThread {
     pub fn new(
         sample_rate: f32,
         number_of_channels: usize,
-        receiver: Receiver<ControlMessage>,
+        receiver: ControlReceiver,
         state: Arc<AtomicU8>,
         frames_played: Arc<AtomicU64>,
         stats: AudioStats,
@@ -132,7 +132,7 @@ impl RenderThread {
         }
 
         for _ in 0..limit {
-            let Ok(msg) = self.receiver.as_ref().unwrap().try_recv() else {
+            let Some(msg) = self.receiver.as_mut().unwrap().try_recv() else {
                 return;
             };
             let result = self.handle_control_message(msg);

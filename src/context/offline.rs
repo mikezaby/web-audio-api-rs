@@ -80,9 +80,8 @@ impl OfflineAudioContext {
         assert_valid_buffer_length(length);
         assert_valid_sample_rate(sample_rate);
 
-        // communication channel to the render thread,
-        // unbounded is fine because it does not need to be realtime safe
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        // communication channel to the render thread
+        let (sender, receiver) = crate::message::control_channel();
 
         let (node_id_producer, node_id_consumer) = llq::Queue::new().split();
         let graph = crate::render::graph::Graph::new(node_id_producer);

@@ -5,7 +5,7 @@ use crate::context::{
     DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
-use crate::message::ControlMessage;
+use crate::message::{ControlMessage, ControlSender};
 use crate::node::{AudioDestinationNode, AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::AudioParam;
 use crate::render::graph::workers::{RealTime, Workers};
@@ -94,7 +94,7 @@ struct ConcreteBaseAudioContextInner {
     /// destination node's current channel count
     destination_channel_config: ChannelConfig,
     /// message channel from control to render thread
-    render_channel: RwLock<Sender<ControlMessage>>,
+    render_channel: RwLock<ControlSender>,
     /// control messages staged while the render thread is suspended
     suspended_messages: Mutex<Option<Vec<ControlMessage>>>,
     /// control messages that cannot be sent immediately
@@ -133,7 +133,7 @@ impl ConcreteBaseAudioContext {
         max_channel_count: usize,
         state: Arc<AtomicU8>,
         frames_played: Arc<AtomicU64>,
-        render_channel: Sender<ControlMessage>,
+        render_channel: ControlSender,
         event_send: Sender<EventDispatch>,
         event_loop: EventLoop,
         offline: bool,
@@ -328,7 +328,7 @@ impl ConcreteBaseAudioContext {
         self.inner.event_send.send(msg)
     }
 
-    pub(crate) fn lock_control_msg_sender(&self) -> RwLockWriteGuard<'_, Sender<ControlMessage>> {
+    pub(crate) fn lock_control_msg_sender(&self) -> RwLockWriteGuard<'_, ControlSender> {
         self.inner.render_channel.write().unwrap()
     }
 

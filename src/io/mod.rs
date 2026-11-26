@@ -12,7 +12,7 @@ use crate::context::{AudioContextLatencyCategory, AudioContextOptions, AudioCont
 use crate::events::EventDispatch;
 use crate::media_devices::MediaDeviceInfo;
 use crate::media_streams::{MediaStream, MediaStreamTrack};
-use crate::message::ControlMessage;
+use crate::message::{control_channel, ControlReceiver, ControlSender};
 use crate::stats::AudioStats;
 use crate::RENDER_QUANTUM_SIZE;
 
@@ -92,7 +92,7 @@ pub(crate) struct ControlThreadInit {
     pub state: Arc<AtomicU8>,
     pub frames_played: Arc<AtomicU64>,
     pub stats: AudioStats,
-    pub ctrl_msg_send: Sender<ControlMessage>,
+    pub ctrl_msg_send: ControlSender,
     pub event_send: Sender<EventDispatch>,
     pub event_recv: Receiver<EventDispatch>,
 }
@@ -103,7 +103,7 @@ pub(crate) struct RenderThreadInit {
     pub startup_pending: Arc<AtomicBool>,
     pub frames_played: Arc<AtomicU64>,
     pub stats: AudioStats,
-    pub ctrl_msg_recv: Receiver<ControlMessage>,
+    pub ctrl_msg_recv: ControlReceiver,
     pub event_send: Sender<EventDispatch>,
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn thread_init() -> (ControlThreadInit, RenderThreadInit) {
     // node with its params takes several messages each, so the capacity takes a large patch
     // without blocking. The render thread handles at most `MAX_CONTROL_MESSAGES_PER_DRAIN`
     // between two render quanta, so a burst spreads over several.
-    let (ctrl_msg_send, ctrl_msg_recv) = crossbeam_channel::bounded(4096);
+    let (ctrl_msg_send, ctrl_msg_recv) = control_channel();
 
     // Communication channel for events from the render thread to the control thread.
     // Use a bounded channel for real-time safety. A maximum of 256 events (node ended, error, ..)
