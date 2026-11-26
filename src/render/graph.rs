@@ -161,8 +161,8 @@ pub(crate) struct Graph {
     marked: Vec<Visit>,
     /// Topological sorting helper
     marked_temp: Vec<AudioNodeId>,
-    /// Topological sorting helper
-    in_cycle: AudioNodeIdSet,
+    /// Topological sorting helper, boxed to keep `Graph` small to move
+    in_cycle: Box<AudioNodeIdSet>,
     /// Topological sorting helper
     cycle_breakers: Vec<AudioNodeId>,
     /// Split of the nodes into render groups, boxed to keep `Graph` small to move
@@ -195,7 +195,7 @@ impl Graph {
             ordered_dirty: false,
             marked: vec![],
             marked_temp: vec![],
-            in_cycle: AudioNodeIdSet::default(),
+            in_cycle: Box::default(),
             cycle_breakers: vec![],
             plan: Box::default(),
             workers: None,
@@ -378,6 +378,8 @@ impl Graph {
         // Therefore, do not assume this node still exists:
         if let Some(node) = self.nodes.get_mut(index) {
             node.get_mut().control_handle_dropped = true;
+            // it renders again to find out whether it can be freed
+            self.nodes.wake(index);
         }
     }
 
@@ -403,6 +405,7 @@ impl Graph {
 
     pub fn route_message(&mut self, index: AudioNodeId, msg: &mut dyn Any) {
         self.nodes.get_unchecked_mut(index).processor.onmessage(msg);
+        self.nodes.wake(index);
     }
 
     /// Helper function for `order_nodes` - traverse node and outgoing edges
@@ -505,7 +508,7 @@ impl Graph {
         let mut ordered = std::mem::take(&mut self.ordered);
         let mut marked = std::mem::take(&mut self.marked);
         let mut marked_temp = std::mem::take(&mut self.marked_temp);
-        let mut in_cycle = std::mem::take(&mut self.in_cycle);
+        let mut in_cycle = std::mem::take(&mut *self.in_cycle);
         let mut cycle_breakers = std::mem::take(&mut self.cycle_breakers);
 
         // When a cycle breaker is applied, the graph topology changes and we need to run the
@@ -568,7 +571,7 @@ impl Graph {
         self.ordered_dirty = false;
         self.marked = marked;
         self.marked_temp = marked_temp;
-        self.in_cycle = in_cycle;
+        *self.in_cycle = in_cycle;
         self.cycle_breakers = cycle_breakers;
 
         self.plan_groups();
@@ -661,6 +664,10 @@ impl Graph {
         index: AudioNodeId,
         scope: &AudioWorkletGlobalScope,
     ) -> bool {
+        if nodes.is_asleep(index) {
+            return false;
+        }
+
         // acquire a mutable borrow of the current processing node
         let mut node = nodes.get_unchecked(index).borrow_mut();
 
@@ -702,6 +709,7 @@ impl Graph {
                 }
 
                 let mut output_node = nodes.get_unchecked(edge.other_id).borrow_mut();
+                nodes.wake(edge.other_id);
                 output_node.has_inputs_connected = true;
                 let channel_config = &output_node.channel_config.clone();
 
@@ -722,6 +730,19 @@ impl Graph {
             node.inputs
                 .iter_mut()
                 .for_each(AudioRenderQuantum::make_silent);
+
+            // A node feeding another node's input has to pass its output on every quantum; a
+            // hidden edge is read straight from its output
+            if !node.has_inputs_connected
+                && !node.control_handle_dropped
+                && node.processor.is_settled()
+                && node
+                    .outgoing_edges
+                    .iter()
+                    .all(|edge| edge.other_index == usize::MAX)
+            {
+                nodes.sleep(index);
+            }
 
             // Reset input state
             node.has_inputs_connected = false;
@@ -1632,5 +1653,164 @@ mod tests {
         let shared = &plan.groups[plan.order[0]];
         assert_eq!(shared.dependencies, 0);
         assert_eq!(shared.dependents.len(), 2);
+    }
+
+    /// Settles once a quantum renders with a silent input, as an `AudioParam` does
+    struct SettleNode {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        settled: bool,
+    }
+
+    impl AudioProcessor for SettleNode {
+        fn process(
+            &mut self,
+            inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.settled = inputs[0].is_silent();
+            true
+        }
+
+        fn onmessage(&mut self, _msg: &mut dyn Any) {
+            self.settled = false;
+        }
+
+        fn is_settled(&self) -> bool {
+            self.settled
+        }
+    }
+
+    /// A graph of a destination (0), the node that owns the param (1), and the param (2) in
+    /// render group `param_group`; returns how many times the param rendered
+    fn settle_graph(param_group: u32) -> (Graph, impl Fn() -> usize) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        let nodes: [(u64, u32, Box<dyn AudioProcessor>); 3] = [
+            (0, 0, Box::new(TestNode { tail_time: false })),
+            (1, param_group, Box::new(TestNode { tail_time: true })),
+            (
+                2,
+                param_group,
+                Box::new(SettleNode {
+                    calls: std::sync::Arc::clone(&calls),
+                    settled: false,
+                }),
+            ),
+        ];
+        for (id, group, node) in nodes {
+            let id = AudioNodeId(id);
+            graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), group);
+        }
+        add_edge(&mut graph, 1, 0);
+        add_audioparam(&mut graph, 2, 1);
+        let count = move || calls.load(std::sync::atomic::Ordering::SeqCst);
+        (graph, count)
+    }
+
+    #[test]
+    fn a_settled_param_sleeps_until_a_message() {
+        let (mut graph, calls) = settle_graph(0);
+        let scope = test_scope();
+        for _ in 0..3 {
+            graph.render(&scope);
+        }
+        assert_eq!(calls(), 1);
+
+        graph.route_message(AudioNodeId(2), &mut ());
+        graph.render(&scope);
+        graph.render(&scope);
+        assert_eq!(calls(), 2);
+    }
+
+    #[test]
+    fn an_input_wakes_a_settled_param_every_quantum() {
+        let (mut graph, calls) = settle_graph(0);
+        let scope = test_scope();
+        graph.render(&scope);
+        graph.render(&scope);
+        assert_eq!(calls(), 1);
+
+        add_node(&mut graph, 3, Box::new(OneNode));
+        add_edge(&mut graph, 3, 2);
+        for _ in 0..3 {
+            graph.render(&scope);
+        }
+        assert_eq!(calls(), 4);
+    }
+
+    #[test]
+    fn a_mailbox_wakes_a_settled_param_of_another_group() {
+        let (mut graph, calls) = settle_graph(1);
+        let scope = test_scope();
+        graph.render(&scope);
+        graph.render(&scope);
+        assert_eq!(calls(), 1);
+
+        let id = AudioNodeId(3);
+        graph.add_node(id, llq::Node::new(id), Box::new(OneNode), 1, 1, config(), 2);
+        add_edge(&mut graph, 3, 2);
+        graph.render(&scope);
+        graph.render(&scope);
+        assert_eq!(calls(), 3);
+        assert_eq!(graph.plan.groups.len(), 3);
+    }
+
+    #[test]
+    fn a_param_whose_handle_dropped_wakes_to_be_freed() {
+        let (mut graph, calls) = settle_graph(0);
+        let scope = test_scope();
+        graph.render(&scope);
+        graph.render(&scope);
+        assert_eq!(calls(), 1);
+
+        graph.mark_control_handle_dropped(AudioNodeId(2));
+        graph.render(&scope);
+        graph.render(&scope);
+        // awake, though its owner keeps it
+        assert_eq!(calls(), 3);
+
+        graph.mark_control_handle_dropped(AudioNodeId(1));
+        graph.nodes.get_unchecked_mut(AudioNodeId(1)).processor =
+            Box::new(TestNode { tail_time: false });
+        graph.render(&scope);
+        graph.render(&scope);
+        assert!(!graph.nodes.contains(AudioNodeId(1)));
+        assert!(!graph.nodes.contains(AudioNodeId(2)));
+    }
+
+    #[test]
+    fn a_settled_node_feeding_an_input_keeps_rendering() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        let node = SettleNode {
+            calls: std::sync::Arc::clone(&calls),
+            settled: false,
+        };
+        add_node(&mut graph, 1, Box::new(node));
+        add_edge(&mut graph, 1, 0);
+
+        let scope = test_scope();
+        for _ in 0..3 {
+            graph.render(&scope);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_reused_id_starts_awake() {
+        let (mut graph, calls) = settle_graph(0);
+        let scope = test_scope();
+        graph.render(&scope);
+        graph.render(&scope);
+        assert!(graph.nodes.is_asleep(AudioNodeId(2)));
+
+        graph.nodes.remove(AudioNodeId(2));
+        add_node(&mut graph, 2, Box::new(TestNode { tail_time: true }));
+        assert!(!graph.nodes.is_asleep(AudioNodeId(2)));
+        assert_eq!(calls(), 1);
     }
 }

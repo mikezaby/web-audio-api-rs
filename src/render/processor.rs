@@ -174,6 +174,14 @@ pub trait AudioProcessor: Send {
         false
     }
 
+    /// Indicates that, until a message arrives or its input is heard, rendering would leave the
+    /// outputs as they are and change nothing else
+    ///
+    /// The graph then leaves the processor out of the render quanta until one of those happens.
+    fn is_settled(&self) -> bool {
+        false
+    }
+
     fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {}
 }
 

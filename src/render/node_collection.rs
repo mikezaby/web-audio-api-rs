@@ -4,6 +4,7 @@ use crate::render::graph::Node;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default)]
 pub(super) struct AudioNodeIdHasher(u64);
@@ -27,12 +28,17 @@ pub(super) type AudioNodeIdSet = HashSet<AudioNodeId, BuildHasherDefault<AudioNo
 #[derive(Debug)]
 pub(crate) struct NodeCollection {
     nodes: Vec<Option<RefCell<Node>>>,
+    /// Per node id, whether the node is left out of the render quanta. Apart from the nodes, so a
+    /// render passes a sleeping node without touching its memory. Render threads share the
+    /// collection, and each sets the flags of the nodes of the groups it renders.
+    asleep: Vec<AtomicBool>,
 }
 
 impl NodeCollection {
     pub fn new() -> Self {
         let mut instance = Self {
             nodes: Vec::with_capacity(64),
+            asleep: Vec::with_capacity(64),
         };
         instance.ensure_capacity(64);
         instance
@@ -47,8 +53,9 @@ impl NodeCollection {
 
     #[inline(always)]
     fn ensure_capacity(&mut self, new_len: usize) {
-        self.nodes
-            .resize_with(new_len.max(self.nodes.len()), || None);
+        let len = new_len.max(self.nodes.len());
+        self.nodes.resize_with(len, || None);
+        self.asleep.resize_with(len, || AtomicBool::new(false));
     }
 
     #[inline(always)]
@@ -56,6 +63,27 @@ impl NodeCollection {
         let index = index.0 as usize;
         self.ensure_capacity(index + 1);
         self.nodes[index] = Some(value);
+        *self.asleep[index].get_mut() = false;
+    }
+
+    #[inline(always)]
+    pub fn is_asleep(&self, index: AudioNodeId) -> bool {
+        self.asleep[index.0 as usize].load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn sleep(&self, index: AudioNodeId) {
+        self.asleep[index.0 as usize].store(true, Ordering::Relaxed);
+    }
+
+    /// Writes only when the node sleeps, so render threads waking their own nodes do not write
+    /// to cache lines another thread reads
+    #[inline(always)]
+    pub fn wake(&self, index: AudioNodeId) {
+        let asleep = &self.asleep[index.0 as usize];
+        if asleep.load(Ordering::Relaxed) {
+            asleep.store(false, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]

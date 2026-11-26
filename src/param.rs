@@ -753,6 +753,10 @@ impl AudioProcessor for AudioParamProcessor {
 
         log::warn!("AudioParamProcessor: Dropping incoming message {msg:?}");
     }
+
+    fn is_settled(&self) -> bool {
+        self.settled
+    }
 }
 
 impl AudioParamProcessor {

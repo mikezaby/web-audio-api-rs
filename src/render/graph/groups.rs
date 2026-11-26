@@ -79,6 +79,7 @@ impl Mailbox {
         }
 
         let mut node = nodes.get_unchecked(self.to).borrow_mut();
+        nodes.wake(self.to);
         node.has_inputs_connected = true;
         let signal = self.quantum.to_quantum(&node.alloc);
         let channel_config = node.channel_config.clone();
