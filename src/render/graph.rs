@@ -144,6 +144,54 @@ enum Visit {
     Done,
 }
 
+/// Keeps the node order topological as edges are added, so a node or edge added while the
+/// graph plays does not re-sort every node (see `Graph::repair_order`)
+#[derive(Debug, Default)]
+struct OrderRepair {
+    /// Each node's index in `ordered`, by node id, `u32::MAX` for none
+    positions: Vec<u32>,
+    /// The repair that last reached each node id
+    seen: Vec<u32>,
+    stamp: u32,
+    stack: Vec<AudioNodeId>,
+    kept: Vec<AudioNodeId>,
+    /// The nodes the last repair moved, in their new order
+    moved: Vec<AudioNodeId>,
+    /// The positions the last repair reordered, `moved` coming last among them
+    span: (usize, usize),
+}
+
+impl OrderRepair {
+    fn position(&self, id: AudioNodeId) -> Option<usize> {
+        match self.positions.get(id.0 as usize) {
+            Some(&position) if position != u32::MAX => Some(position as usize),
+            _ => None,
+        }
+    }
+
+    /// Positions of `ordered[range]`
+    fn number(&mut self, ordered: &[AudioNodeId], range: std::ops::Range<usize>) {
+        for index in range {
+            let id = ordered[index].0 as usize;
+            if self.positions.len() <= id {
+                self.positions.resize(id + 1, u32::MAX);
+            }
+            self.positions[id] = index as u32;
+        }
+    }
+
+    /// Whether the last repair moved `id`
+    fn moved_last(&self, id: AudioNodeId) -> bool {
+        !self.moved.is_empty() && self.seen.get(id.0 as usize) == Some(&self.stamp)
+    }
+
+    fn renumber(&mut self, ordered: &[AudioNodeId]) {
+        self.positions.fill(u32::MAX);
+        self.number(ordered, 0..ordered.len());
+        self.moved.clear();
+    }
+}
+
 /// The audio graph
 pub(crate) struct Graph {
     /// Processing Nodes
@@ -167,6 +215,8 @@ pub(crate) struct Graph {
     cycle_breakers: Vec<AudioNodeId>,
     /// Split of the nodes into render groups, boxed to keep `Graph` small to move
     plan: Box<GroupPlan>,
+    /// What keeps `ordered` topological without a re-sort, boxed to keep `Graph` small
+    repair: Box<OrderRepair>,
     /// Helper threads rendering groups alongside the render thread, boxed to keep `Graph` small
     workers: Option<Box<Workers>>,
     /// Nodes that ended this quantum, removed once every node rendered
@@ -198,6 +248,7 @@ impl Graph {
             in_cycle: Box::default(),
             cycle_breakers: vec![],
             plan: Box::default(),
+            repair: Box::default(),
             workers: None,
             dropped: Vec::with_capacity(64),
             spare_quanta: Vec::with_capacity(SPARE_QUANTA),
@@ -325,11 +376,21 @@ impl Graph {
             }),
         );
 
-        // add to ordered list (some nodes should be processed even if not connected)
-        // if the node is connected later the ordered list will be recomputed
-        // a node in a render group needs a place in the group plan, so it re-sorts
-        if self.plan.groups.is_empty() && !self.ordered_dirty {
+        // add to ordered list (some nodes should be processed even if not connected), last:
+        // with no edges yet it may render anywhere, and its edges repair the order
+        // a node in a render group takes the end of its group's list, or a new group re-sorts
+        if self.ordered_dirty {
+            return;
+        }
+        let placed = if self.plan.groups.is_empty() {
+            render_group == 0
+        } else {
+            self.place_in_plan(index, render_group)
+        };
+        if placed {
             self.ordered.push(index);
+            let end = self.ordered.len();
+            self.repair.number(&self.ordered, end - 1..end);
         } else {
             self.ordered_dirty = true;
         }
@@ -354,7 +415,80 @@ impl Graph {
                 mailbox: usize::MAX,
             });
 
-        self.ordered_dirty = true; // void current ordering
+        // repair the ordering, or void it
+        if !self.ordered_dirty {
+            let repaired = self.repair_order(source.0, dest.0) && self.plan_edge(source, dest);
+            self.ordered_dirty = !repaired;
+        }
+    }
+
+    /// Keeps `ordered` topological once an edge `x -> y` is in, without re-sorting
+    ///
+    /// An edge along the order needs nothing. One against it moves what `y` reaches before
+    /// `x`'s place to just after `x`, the rest of that span keeping its order: nothing moved
+    /// has an edge into the rest of the span, or the rest would have been reached. This is
+    /// one side of Pearce and Kelly's repair. False when only a full sort will do: the edge
+    /// closes a cycle (a cycle breaker or muting is the sort's to decide), or a node has no
+    /// place in the order.
+    fn repair_order(&mut self, x: AudioNodeId, y: AudioNodeId) -> bool {
+        let repair = &mut *self.repair;
+        repair.moved.clear();
+        if !self.in_cycle.is_empty() || x == y {
+            return false;
+        }
+        let (Some(px), Some(py)) = (repair.position(x), repair.position(y)) else {
+            return false;
+        };
+        if px < py {
+            return true;
+        }
+
+        repair.stamp = repair.stamp.wrapping_add(1);
+        if repair.stamp == 0 {
+            repair.seen.fill(0);
+            repair.stamp = 1;
+        }
+        let stamp = repair.stamp;
+        if repair.seen.len() < repair.positions.len() {
+            repair.seen.resize(repair.positions.len(), 0);
+        }
+        repair.seen[y.0 as usize] = stamp;
+        repair.stack.clear();
+        repair.stack.push(y);
+        while let Some(id) = repair.stack.pop() {
+            for edge in &self.nodes.get_unchecked(id).borrow().outgoing_edges {
+                let next = edge.other_id;
+                if next == x {
+                    return false;
+                }
+                match repair.position(next) {
+                    Some(position) if position < px => {}
+                    Some(_) => continue,
+                    None => return false,
+                }
+                let seen = &mut repair.seen[next.0 as usize];
+                if *seen != stamp {
+                    *seen = stamp;
+                    repair.stack.push(next);
+                }
+            }
+        }
+
+        repair.kept.clear();
+        for &id in &self.ordered[py..=px] {
+            if repair.seen[id.0 as usize] == stamp {
+                repair.moved.push(id);
+            } else {
+                repair.kept.push(id);
+            }
+        }
+        let span = &mut self.ordered[py..=px];
+        let kept = repair.kept.len();
+        span[..kept].copy_from_slice(&repair.kept);
+        span[kept..].copy_from_slice(&repair.moved);
+        repair.number(&self.ordered, py..px + 1);
+        repair.span = (py, px);
+        true
     }
 
     pub fn remove_edge(&mut self, source: (AudioNodeId, usize), dest: (AudioNodeId, usize)) {
@@ -573,6 +707,7 @@ impl Graph {
         self.marked_temp = marked_temp;
         *self.in_cycle = in_cycle;
         self.cycle_breakers = cycle_breakers;
+        self.repair.renumber(&self.ordered);
 
         self.plan_groups();
     }
@@ -799,6 +934,7 @@ impl Graph {
 
         let nodes = &self.nodes;
         self.ordered.retain(|&index| nodes.contains(index));
+        self.repair.renumber(&self.ordered);
         for group in &mut self.plan.groups {
             group.ordered.retain(|&index| nodes.contains(index));
         }
@@ -1812,5 +1948,192 @@ mod tests {
         add_node(&mut graph, 2, Box::new(TestNode { tail_time: true }));
         assert!(!graph.nodes.is_asleep(AudioNodeId(2)));
         assert_eq!(calls(), 1);
+    }
+
+    fn add_node_in(graph: &mut Graph, id: u64, render_group: u32) {
+        let id = AudioNodeId(id);
+        let node = Box::new(TestNode { tail_time: true });
+        graph.add_node(id, llq::Node::new(id), node, 1, 1, config(), render_group);
+    }
+
+    /// Every node in the order once, every edge along it, and the plan what a rebuild from
+    /// that order would make: what a full sort and plan give, up to which order
+    fn assert_order_and_plan(graph: &Graph) {
+        assert!(!graph.ordered_dirty);
+        for (index, &id) in graph.ordered.iter().enumerate() {
+            assert_eq!(graph.repair.position(id), Some(index), "position of {id:?}");
+        }
+        if graph.in_cycle.is_empty() {
+            let mut nodes: Vec<_> = graph.nodes.keys().map(|id| id.0).collect();
+            let mut ordered: Vec<_> = graph.ordered.iter().map(|id| id.0).collect();
+            nodes.sort_unstable();
+            ordered.sort_unstable();
+            assert_eq!(nodes, ordered, "every node once");
+            for id in graph.nodes.keys() {
+                for edge in &graph.nodes.get_unchecked(id).borrow().outgoing_edges {
+                    assert!(
+                        graph.repair.position(id) < graph.repair.position(edge.other_id),
+                        "{id:?} -> {:?} against the order",
+                        edge.other_id
+                    );
+                }
+            }
+        }
+        graph.assert_plan_matches_order();
+    }
+
+    /// Nodes and edges added and edges removed at random, over three render groups: the
+    /// order and plan repaired after each change match what a full sort would give
+    #[test]
+    fn a_repaired_order_and_plan_match_a_full_sort() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let (mut repaired, mut sorted) = (0, 0);
+        for seed in 0..40 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut graph = Graph::new(llq::Queue::new().split().0);
+            add_node_in(&mut graph, 0, 0);
+            add_node_in(&mut graph, 1, 1);
+            add_node_in(&mut graph, 2, 2);
+            add_edge(&mut graph, 1, 0);
+            add_edge(&mut graph, 2, 0);
+            graph.order_nodes();
+            // Edges follow a random rank, so the graph stays acyclic while many run against
+            // the order nodes were added in
+            let mut rank = vec![rng.random_range(0..1000_u32), 1000, 1000];
+            rank[0] = 2000;
+            for _ in 0..400 {
+                let count = rank.len() as u64;
+                match rng.random_range(0..10) {
+                    0..=2 => {
+                        add_node_in(&mut graph, count, rng.random_range(0..3));
+                        rank.push(rng.random_range(0..1000));
+                    }
+                    3..=7 => {
+                        let a = rng.random_range(0..count);
+                        let b = rng.random_range(0..count);
+                        let cyclic = rng.random_range(0..20) == 0;
+                        let (from, to) = if cyclic || rank[a as usize] < rank[b as usize] {
+                            (a, b)
+                        } else {
+                            (b, a)
+                        };
+                        if from == to {
+                            continue;
+                        }
+                        if rng.random_range(0..6) == 0 {
+                            add_audioparam(&mut graph, from, to);
+                        } else {
+                            add_edge(&mut graph, from, to);
+                        }
+                    }
+                    _ => {
+                        let id = AudioNodeId(rng.random_range(0..count));
+                        let edge = graph
+                            .nodes
+                            .get_unchecked(id)
+                            .borrow()
+                            .outgoing_edges
+                            .first()
+                            .map(|edge| (edge.self_index, edge.other_id, edge.other_index));
+                        if let Some((output, to, input)) = edge {
+                            graph.remove_edge((id, output), (to, input));
+                        }
+                    }
+                }
+                if graph.ordered_dirty {
+                    sorted += 1;
+                    graph.order_nodes();
+                } else {
+                    repaired += 1;
+                }
+                assert_order_and_plan(&graph);
+            }
+        }
+        // Most changes repair rather than re-sort; a cycle re-sorts every change until it goes
+        assert!(
+            repaired > 2 * sorted,
+            "{repaired} repaired, {sorted} sorted"
+        );
+    }
+
+    /// A recipe's graph: tracks of 8 voices, each an oscillator, a VCA, a level and a filter
+    /// with their params, into a track bus, a master and the destination, the tracks split
+    /// over render groups 1 and 2. Returns each voice's oscillator gain, what a stopped
+    /// oscillator's new node connects to.
+    fn recipe_graph(graph: &mut Graph, tracks: u64) -> Vec<(u64, u32)> {
+        let mut next = 0;
+        let mut node = |graph: &mut Graph, group: u32| {
+            add_node_in(graph, next, group);
+            next += 1;
+            next - 1
+        };
+        node(graph, 0); // destination
+        let master = node(graph, 0);
+        add_edge(graph, master, 0);
+        let mut gains = vec![];
+        for track in 0..tracks {
+            let group = 1 + (track % 2) as u32;
+            let bus = node(graph, group);
+            for _ in 0..8 {
+                let chain: Vec<u64> = (0..5).map(|_| node(graph, group)).collect();
+                for pair in chain.windows(2) {
+                    add_edge(graph, pair[0], pair[1]);
+                }
+                add_edge(graph, chain[4], bus);
+                gains.push((chain[1], group));
+                for owner in [0, 0, 1, 2, 3, 4, 4, 4] {
+                    let param = node(graph, group);
+                    add_audioparam(graph, param, chain[owner]);
+                }
+            }
+            add_edge(graph, bus, master);
+        }
+        gains
+    }
+
+    #[test]
+    #[ignore = "a benchmark: cargo test --release --lib graph_stop_bench -- --ignored --nocapture"]
+    fn graph_stop_bench() {
+        use std::time::Instant;
+
+        // A stop rebuilds each stopped oscillator: a node and its two params, connected to
+        // the gain the old one fed, three oscillators to a period over twenty periods
+        for repair in [false, true] {
+            let mut graph = Graph::new(llq::Queue::new().split().0);
+            let gains = recipe_graph(&mut graph, 15);
+            graph.order_nodes();
+            let mut next = graph.nodes.keys().map(|id| id.0).max().unwrap() + 1;
+            let mut periods = vec![];
+            for period in gains.chunks(3).take(20) {
+                let start = Instant::now();
+                for &(gain, group) in period {
+                    let osc = next;
+                    add_node_in(&mut graph, osc, group);
+                    for param in [osc + 1, osc + 2] {
+                        add_node_in(&mut graph, param, group);
+                        add_audioparam(&mut graph, param, osc);
+                    }
+                    add_edge(&mut graph, osc, gain);
+                    next += 3;
+                }
+                if !repair {
+                    graph.ordered_dirty = true;
+                }
+                if graph.ordered_dirty {
+                    graph.order_nodes();
+                }
+                periods.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            periods.sort_by(f64::total_cmp);
+            println!(
+                "{} nodes, {}: per period median {:.1} us, max {:.1} us",
+                graph.nodes.keys().count(),
+                if repair { "repaired" } else { "full sort" },
+                periods[periods.len() / 2],
+                periods[periods.len() - 1],
+            );
+        }
     }
 }

@@ -41,6 +41,13 @@ impl<T> SyncCell<T> {
         self.0.get_mut()
     }
 
+    /// A shared look, for tests that hold the graph whole
+    #[cfg(test)]
+    pub fn get_ref(&self) -> &T {
+        // SAFETY: a test reads the plan only while nothing renders
+        unsafe { &*self.0.get() }
+    }
+
     /// # Safety
     ///
     /// No other reference to the value may be alive. During a quantum, only the thread that
@@ -115,6 +122,15 @@ pub(super) struct GroupPlan {
     pub mailboxes: Vec<SyncCell<Mailbox>>,
     /// Per group, the groups it still waits for in this quantum
     pub pending: Vec<AtomicUsize>,
+    /// The group of each node, by node id, `usize::MAX` for none
+    node_group: Vec<usize>,
+    /// The group of each render group id, sorted by id
+    render_groups: Vec<(u32, usize)>,
+    /// Mailboxes when the plan was last built, so patched ones cannot pile up
+    built_mailboxes: usize,
+    /// Groups whose list a patch reorders, and the run it reorders
+    stale: Vec<bool>,
+    run: Vec<AudioNodeId>,
     // Scratch space, kept to avoid allocating on every rebuild
     ids: Vec<u32>,
     parent: Vec<usize>,
@@ -233,6 +249,7 @@ impl Graph {
         if plan.ids.len() <= 1 {
             plan.groups.clear();
             plan.mailboxes.clear();
+            plan.render_groups.clear();
             return;
         }
 
@@ -303,10 +320,17 @@ impl Graph {
             }
         }
 
+        plan.render_groups.clear();
+        plan.render_groups
+            .extend(ids.iter().enumerate().map(|(v, &id)| (id, plan.slot[v])));
+
         // A filtered topological order is still topological within the group
+        plan.node_group.clear();
+        plan.node_group.resize(self.nodes.id_count(), usize::MAX);
         for &id in &self.ordered {
-            let group = index(self.nodes.get_unchecked(id).borrow().render_group);
-            plan.groups[plan.slot[group]].ordered.push(id);
+            let group = plan.slot[index(self.nodes.get_unchecked(id).borrow().render_group)];
+            plan.groups[group].ordered.push(id);
+            plan.node_group[id.0 as usize] = group;
         }
 
         // Edges between groups go through mailboxes, reusing the previous ones
@@ -347,6 +371,7 @@ impl Graph {
             }
         }
         plan.mailboxes.truncate(mailboxes);
+        plan.built_mailboxes = mailboxes;
         let mailboxes = &mut plan.mailboxes;
         for group in &mut plan.groups {
             group.incoming.sort_unstable_by_key(|&m| {
@@ -384,5 +409,200 @@ impl Graph {
             }
         }
         debug_assert_eq!(plan.order.len(), count, "render groups left in a cycle");
+    }
+
+    /// Gives a new node with no edges the end of its group's list. False when its render
+    /// group has no group in the plan, which a rebuild makes.
+    pub(super) fn place_in_plan(&mut self, id: AudioNodeId, render_group: u32) -> bool {
+        let plan = &mut *self.plan;
+        let Ok(found) = plan
+            .render_groups
+            .binary_search_by_key(&render_group, |&(group, _)| group)
+        else {
+            return false;
+        };
+        let group = plan.render_groups[found].1;
+        let index = id.0 as usize;
+        if plan.node_group.len() <= index {
+            plan.node_group.resize(index + 1, usize::MAX);
+        }
+        plan.node_group[index] = group;
+        plan.groups[group].ordered.push(id);
+        true
+    }
+
+    /// Patches the plan for an edge the order took without a re-sort (`repair_order`)
+    ///
+    /// The lists of the groups whose nodes moved are filtered from the order again. An edge
+    /// between groups already linked gets a mailbox, as a rebuild would make it. False when
+    /// only a rebuild will do: the edge is a param's into another group, which joins the
+    /// two, or it links two groups that were not, which may join them in a cycle.
+    pub(super) fn plan_edge(
+        &mut self,
+        source: (AudioNodeId, usize),
+        dest: (AudioNodeId, usize),
+    ) -> bool {
+        let plan = &mut *self.plan;
+        if plan.groups.is_empty() {
+            return true;
+        }
+        let group_of = |plan: &GroupPlan, id: AudioNodeId| {
+            plan.node_group
+                .get(id.0 as usize)
+                .copied()
+                .filter(|&group| group != usize::MAX)
+        };
+
+        // A group's list is the order filtered to it, so the span the order reordered is a
+        // run of it too, found by position; within the run its moved nodes go last, in order.
+        if !self.repair.moved.is_empty() {
+            plan.stale.clear();
+            plan.stale.resize(plan.groups.len(), false);
+            for &id in &self.repair.moved {
+                let Some(group) = group_of(plan, id) else {
+                    return false;
+                };
+                plan.stale[group] = true;
+            }
+            let (first, last) = self.repair.span;
+            let repair = &*self.repair;
+            let position = |id: AudioNodeId| repair.position(id).unwrap_or(usize::MAX);
+            for (group, &stale) in plan.groups.iter_mut().zip(&plan.stale) {
+                if !stale {
+                    continue;
+                }
+                let list = &mut group.ordered;
+                let start = list.partition_point(|&id| position(id) < first);
+                let end = list.partition_point(|&id| position(id) <= last);
+                plan.run.clear();
+                plan.run.extend(
+                    list[start..end]
+                        .iter()
+                        .copied()
+                        .filter(|&id| !repair.moved_last(id)),
+                );
+                plan.run.extend(
+                    list[start..end]
+                        .iter()
+                        .copied()
+                        .filter(|&id| repair.moved_last(id)),
+                );
+                list[start..end].copy_from_slice(&plan.run);
+            }
+        }
+
+        let (Some(from), Some(to)) = (group_of(plan, source.0), group_of(plan, dest.0)) else {
+            return false;
+        };
+        if from == to {
+            return true;
+        }
+        // ponytail: a patch never drops a mailbox; past twice the built ones, rebuild
+        if dest.1 == usize::MAX
+            || !plan.groups[from].dependents.contains(&to)
+            || plan.mailboxes.len() >= 2 * plan.built_mailboxes + 64
+        {
+            return false;
+        }
+
+        let mailbox = plan.mailboxes.len();
+        plan.mailboxes.push(SyncCell::new(Mailbox {
+            from: source.0,
+            output: source.1,
+            to: dest.0,
+            input: dest.1,
+            written: false,
+            quantum: QuantumCopy::default(),
+        }));
+        let mailboxes = &mut plan.mailboxes;
+        let incoming = &mut plan.groups[to].incoming;
+        incoming.push(mailbox);
+        incoming.sort_unstable_by_key(|&m| {
+            let m = mailboxes[m].get_mut();
+            (m.from.0, m.output, m.to.0, m.input)
+        });
+        let mut node = self.nodes.get_unchecked(source.0).borrow_mut();
+        let edge = node
+            .outgoing_edges
+            .iter_mut()
+            .rev()
+            .find(|edge| {
+                edge.other_id == dest.0 && edge.self_index == source.1 && edge.other_index == dest.1
+            })
+            .expect("the edge was just added");
+        edge.mailbox = mailbox;
+        true
+    }
+
+    /// Panics unless the plan is what a rebuild from the current order would make: each
+    /// group's list the order filtered to it, and a mailbox for each edge between groups,
+    /// delivered by its consumer in producer order
+    #[cfg(test)]
+    pub(super) fn assert_plan_matches_order(&self) {
+        let plan = &*self.plan;
+        if plan.groups.is_empty() {
+            return;
+        }
+        for (index, group) in plan.groups.iter().enumerate() {
+            let expected: Vec<_> = self
+                .ordered
+                .iter()
+                .copied()
+                .filter(|id| plan.node_group[id.0 as usize] == index)
+                .collect();
+            assert_eq!(group.ordered, expected, "group {index}'s list");
+        }
+        // a node muted in a cycle has no place in the order, so its group is its render group's
+        let group_of = |id: AudioNodeId| {
+            let render_group = self.nodes.get_unchecked(id).borrow().render_group;
+            let found = plan
+                .render_groups
+                .binary_search_by_key(&render_group, |&(group, _)| group)
+                .expect("a render group in the plan");
+            plan.render_groups[found].1
+        };
+        for &id in &self.ordered {
+            assert_eq!(
+                plan.node_group[id.0 as usize],
+                group_of(id),
+                "group of {id:?}"
+            );
+        }
+        for id in self.nodes.keys() {
+            let node = self.nodes.get_unchecked(id).borrow();
+            let from = group_of(id);
+            for edge in &node.outgoing_edges {
+                let to = if edge.other_id == id {
+                    from
+                } else {
+                    group_of(edge.other_id)
+                };
+                if from == to || edge.other_id == id {
+                    assert_eq!(edge.mailbox, usize::MAX, "edge in one group");
+                    continue;
+                }
+                let mailbox = plan.mailboxes[edge.mailbox].get_ref();
+                assert_eq!(
+                    (mailbox.from, mailbox.output, mailbox.to, mailbox.input),
+                    (id, edge.self_index, edge.other_id, edge.other_index)
+                );
+                assert!(plan.groups[to].incoming.contains(&edge.mailbox));
+                assert!(plan.groups[from].dependents.contains(&to));
+            }
+        }
+        for group in &plan.groups {
+            let keys: Vec<_> = group
+                .incoming
+                .iter()
+                .map(|&m| {
+                    let m = plan.mailboxes[m].get_ref();
+                    (m.from.0, m.output, m.to.0, m.input)
+                })
+                .collect();
+            assert!(
+                keys.windows(2).all(|pair| pair[0] <= pair[1]),
+                "incoming order"
+            );
+        }
     }
 }
